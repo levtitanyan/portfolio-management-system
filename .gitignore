@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/
+
+# macOS
+.DS_Store
+
+# Environment variables
+.env
+
+# Logs
+*.log
+
+
+# Whole Data
+data/
+
+# Generated data outputs
+# data/processed/
+# data/final_model_dataset.csv
+
+# Optional: ignore raw downloaded data too
+# data/raw/

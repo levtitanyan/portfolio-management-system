@@ -1,8 +1,6 @@
 """
 Download daily historical market data from Yahoo Finance with yfinance.
 
-Install dependencies with:
-    pip install yfinance pandas
 """
 
 from pathlib import Path
@@ -16,23 +14,23 @@ END_DATE = "2025-01-01"
 OUTPUT_DIR = Path("data/raw")
 
 TICKERS = [
-    "AAPL",
-    "MSFT",
-    "JPM",
-    "GS",
-    "V",
-    "WMT",
-    "HD",
-    "MCD",
-    "JNJ",
-    "PG",
-    "KO",
-    "CVX",
-    "CAT",
-    "IBM",
-    "DIS",
-    "SPY",
-    "^VIX",
+    "AAPL", # Apple
+    "MSFT", # Microsoft
+    "JPM",  # JPMorgan Chase
+    "GS",   # Goldman Sachs
+    "V",    # Visa
+    "WMT",  # Walmart
+    "HD",   # Home Depot
+    "MCD",  # McDonald's
+    "JNJ",  # Johnson & Johnson
+    "PG",   # Procter & Gamble
+    "KO",   # Coca-Cola
+    "CVX",  # Chevron
+    "CAT",  # Caterpillar
+    "IBM",  # IBM
+    "DIS",  # Disney
+    "SPY",  # SPDR S&P 500 ETF
+    "^VIX", # CBOE Volatility Index
 ]
 
 CSV_COLUMNS = ["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume"]
