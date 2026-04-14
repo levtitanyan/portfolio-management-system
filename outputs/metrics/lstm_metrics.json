@@ -1,0 +1,29 @@
+{
+  "model": "lstm",
+  "config": {
+    "lookback": 20,
+    "hidden_size": 128,
+    "num_layers": 2,
+    "dropout": 0.2,
+    "batch_size": 64,
+    "learning_rate": 0.0005,
+    "max_epochs": 50,
+    "patience": 10,
+    "embedding_dim": 8
+  },
+  "train": {
+    "mae": 0.010812081396579742,
+    "rmse": 0.016911688400141227,
+    "directional_accuracy": 0.5016374269005848
+  },
+  "validation": {
+    "mae": 0.011343018151819706,
+    "rmse": 0.015812634772889723,
+    "directional_accuracy": 0.5092169092169092
+  },
+  "test": {
+    "mae": 0.009187702089548111,
+    "rmse": 0.013115352492855075,
+    "directional_accuracy": 0.49956709956709955
+  }
+}
