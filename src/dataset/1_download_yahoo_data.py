@@ -1,5 +1,11 @@
 """
 Download daily historical market data from Yahoo Finance with yfinance.
+
+Downloads 30 large U.S. stocks across sectors, plus SPY (market proxy)
+and VIX (volatility index). Saves one CSV per ticker in data/raw/.
+
+Run from the project root:
+    python src/dataset/1_download_yahoo_data.py
 """
 
 from pathlib import Path
@@ -13,23 +19,47 @@ END_DATE = "2025-01-01"
 OUTPUT_DIR = Path("data/raw")
 
 TICKERS = [
-    "AAPL",  # Apple
-    "MSFT",  # Microsoft
-    "JPM",   # JPMorgan Chase
-    "GS",    # Goldman Sachs
-    "V",     # Visa
-    "WMT",   # Walmart
-    "HD",    # Home Depot
-    "MCD",   # McDonald's
-    "JNJ",   # Johnson & Johnson
-    "PG",    # Procter & Gamble
-    "KO",    # Coca-Cola
-    "CVX",   # Chevron
-    "CAT",   # Caterpillar
-    "IBM",   # IBM
-    "DIS",   # Disney
-    "SPY",   # SPDR S&P 500 ETF
-    "^VIX",  # CBOE Volatility Index
+    # ── Technology ─────────────────────────────────────────────────────────────
+    "AAPL",   # Apple
+    "MSFT",   # Microsoft
+    "GOOGL",  # Alphabet (Google)
+    "NVDA",   # NVIDIA
+    "ADBE",   # Adobe
+    "CRM",    # Salesforce
+    # ── Financials ─────────────────────────────────────────────────────────────
+    "JPM",    # JPMorgan Chase
+    "GS",     # Goldman Sachs
+    "V",      # Visa
+    "BAC",    # Bank of America
+    # ── Consumer / Retail ──────────────────────────────────────────────────────
+    "WMT",    # Walmart
+    "HD",     # Home Depot
+    "MCD",    # McDonald's
+    "AMZN",   # Amazon
+    "NKE",    # Nike
+    "COST",   # Costco
+    # ── Healthcare ─────────────────────────────────────────────────────────────
+    "JNJ",    # Johnson & Johnson
+    "PFE",    # Pfizer
+    "UNH",    # UnitedHealth
+    "ABT",    # Abbott Laboratories
+    # ── Consumer Staples ───────────────────────────────────────────────────────
+    "PG",     # Procter & Gamble
+    "KO",     # Coca-Cola
+    # ── Energy ─────────────────────────────────────────────────────────────────
+    "CVX",    # Chevron
+    "XOM",    # ExxonMobil
+    # ── Industrials ────────────────────────────────────────────────────────────
+    "CAT",    # Caterpillar
+    "HON",    # Honeywell
+    "BA",     # Boeing
+    # ── Other ──────────────────────────────────────────────────────────────────
+    "IBM",    # IBM
+    "DIS",    # Disney
+    "NEE",    # NextEra Energy (Utilities)
+    # ── Market references ──────────────────────────────────────────────────────
+    "SPY",    # SPDR S&P 500 ETF
+    "^VIX",   # CBOE Volatility Index
 ]
 
 CSV_COLUMNS = ["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume"]
@@ -70,8 +100,6 @@ def prepare_dataframe(data: pd.DataFrame, ticker: str) -> pd.DataFrame:
     """
     data = normalize_columns(data, ticker)
 
-    # Newer yfinance versions occasionally omit Adj Close.
-    # Fall back to Close to keep the output schema consistent.
     if "Adj Close" not in data.columns:
         if "Close" not in data.columns:
             raise ValueError(
@@ -81,8 +109,6 @@ def prepare_dataframe(data: pd.DataFrame, ticker: str) -> pd.DataFrame:
 
     data = data.reset_index()
 
-    # After reset_index() the date index is usually named 'Date'.
-    # This fallback handles edge cases where the label differs.
     if "Date" not in data.columns:
         first_column = data.columns[0]
         data = data.rename(columns={first_column: "Date"})
@@ -101,7 +127,6 @@ def prepare_dataframe(data: pd.DataFrame, ticker: str) -> pd.DataFrame:
 def download_ticker(ticker: str, output_dir: Path) -> tuple[str, int]:
     """
     Download one ticker, save it as a CSV, and return (filename, row_count).
-
     The filename is sanitized so that tickers like ^VIX are saved as VIX.csv.
     """
     data = yf.download(
@@ -130,8 +155,8 @@ def download_ticker(ticker: str, output_dir: Path) -> tuple[str, int]:
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    successful: list[tuple[str, str, int]] = []  # (ticker, filename, rows)
-    failed: list[tuple[str, str]] = []            # (ticker, error message)
+    successful: list[tuple[str, str, int]] = []
+    failed: list[tuple[str, str]] = []
 
     for ticker in TICKERS:
         try:

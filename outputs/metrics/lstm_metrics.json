@@ -1,29 +1,108 @@
-{
-  "model": "lstm",
-  "config": {
-    "lookback": 20,
-    "hidden_size": 128,
-    "num_layers": 2,
-    "dropout": 0.2,
-    "batch_size": 64,
-    "learning_rate": 0.0005,
-    "max_epochs": 50,
-    "patience": 10,
-    "embedding_dim": 8
+[
+  {
+    "model": "lstm",
+    "target": "target_next_day_return",
+    "config": {
+      "lookback": 20,
+      "hidden_size": 128,
+      "num_layers": 2,
+      "dropout": 0.2,
+      "batch_size": 64,
+      "learning_rate": 0.0005,
+      "max_epochs": 50,
+      "patience": 10,
+      "embedding_dim": 8
+    },
+    "train": {
+      "mae": 0.011629950255155563,
+      "rmse": 0.01794303918551575,
+      "directional_accuracy": 0.510662768031189
+    },
+    "validation": {
+      "mae": 0.01347038708627224,
+      "rmse": 0.019058942972258935,
+      "directional_accuracy": 0.5103257103257103
+    },
+    "test": {
+      "mae": 0.011057259514927864,
+      "rmse": 0.01643591789007037,
+      "directional_accuracy": 0.5088105726872246
+    },
+    "test_backtest": {
+      "long_only": {
+        "final_value": 14033.519346915411,
+        "total_return": 0.40335193469154107,
+        "sharpe_ratio": 2.7431176562829838,
+        "max_drawdown": -0.06482206486720954,
+        "n_trading_days": 227
+      },
+      "long_short": {
+        "final_value": 11683.062037837755,
+        "total_return": 0.16830620378377548,
+        "sharpe_ratio": 2.1952529470469977,
+        "max_drawdown": -0.06210718368653769,
+        "n_trading_days": 227
+      },
+      "buy_and_hold_benchmark": {
+        "final_value": 11821.012787756517,
+        "total_return": 0.18210127877565174,
+        "sharpe_ratio": 1.841074501376622,
+        "max_drawdown": -0.05784500713409594,
+        "n_trading_days": 227
+      }
+    }
   },
-  "train": {
-    "mae": 0.010812081396579742,
-    "rmse": 0.016911688400141227,
-    "directional_accuracy": 0.5016374269005848
-  },
-  "validation": {
-    "mae": 0.011343018151819706,
-    "rmse": 0.015812634772889723,
-    "directional_accuracy": 0.5092169092169092
-  },
-  "test": {
-    "mae": 0.009187702089548111,
-    "rmse": 0.013115352492855075,
-    "directional_accuracy": 0.49956709956709955
+  {
+    "model": "lstm",
+    "target": "target_5d_return",
+    "config": {
+      "lookback": 20,
+      "hidden_size": 128,
+      "num_layers": 2,
+      "dropout": 0.2,
+      "batch_size": 64,
+      "learning_rate": 0.0005,
+      "max_epochs": 50,
+      "patience": 10,
+      "embedding_dim": 8
+    },
+    "train": {
+      "mae": 0.02633768506348133,
+      "rmse": 0.038824853114023276,
+      "directional_accuracy": 0.5551851851851852
+    },
+    "validation": {
+      "mae": 0.032020069658756256,
+      "rmse": 0.043772950177200814,
+      "directional_accuracy": 0.5171864171864172
+    },
+    "test": {
+      "mae": 0.02628125436604023,
+      "rmse": 0.036209559769330615,
+      "directional_accuracy": 0.54287812041116
+    },
+    "test_backtest": {
+      "long_only": {
+        "final_value": 21026.8602686269,
+        "total_return": 1.1026860268626901,
+        "sharpe_ratio": 2.594315042919201,
+        "max_drawdown": -0.23299529143074035,
+        "n_trading_days": 227
+      },
+      "long_short": {
+        "final_value": 8825.960475562164,
+        "total_return": -0.11740395244378365,
+        "sharpe_ratio": -0.6977523700937167,
+        "max_drawdown": -0.26544180813644175,
+        "n_trading_days": 227
+      },
+      "buy_and_hold_benchmark": {
+        "final_value": 21248.632331212866,
+        "total_return": 1.1248632331212867,
+        "sharpe_ratio": 3.620310495112249,
+        "max_drawdown": -0.18781940529829969,
+        "n_trading_days": 227
+      }
+    }
   }
-}
+]

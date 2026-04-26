@@ -2,8 +2,20 @@
 Build a clean feature engineering dataset for daily stock return prediction.
 
 Reads raw stock CSV files from data/raw/, computes technical and market
-features, creates a next-day return target, and saves both per-stock
+features, creates next-day and 5-day return targets, and saves both per-stock
 processed files and one combined modeling dataset.
+
+Features (19 total):
+    Price:      log_return, return_5d, return_10d
+    Volume:     volume_change, volume_ma_ratio, obv_change
+    Momentum:   rsi_14, macd, macd_signal, macd_diff, rolling_sharpe_20
+    Volatility: volatility_10, atr_14, bollinger_band_width
+    Market:     spy_log_return, vix_close, vix_log_return, relative_strength
+    Calendar:   day_of_week
+
+Targets:
+    target_next_day_return  — next trading day's log return
+    target_5d_return        — cumulative 5-day forward log return
 
 Install dependencies with:
     pip install pandas numpy ta
@@ -17,6 +29,7 @@ import pandas as pd
 try:
     from ta.momentum import RSIIndicator
     from ta.trend import MACD
+    from ta.volatility import BollingerBands, AverageTrueRange
 except ImportError as error:
     raise SystemExit(
         "Missing dependency 'ta'. Install with: pip install pandas numpy ta"
@@ -30,7 +43,7 @@ PROCESSED_DATA_DIR = Path("data/processed")
 FINAL_DATASET_PATH = Path("data/final_model_dataset.csv")
 
 SPY_FILE = "SPY.csv"
-VIX_FILE = "VIX.csv"   # saved as VIX.csv by download_yahoo_data.py (^ stripped)
+VIX_FILE = "VIX.csv"
 
 # ── Output schema ──────────────────────────────────────────────────────────────
 
@@ -39,30 +52,42 @@ OUTPUT_COLUMNS = [
     "ticker",
     "adj_close",
     "volume",
+    # Price features
     "log_return",
+    "return_5d",
+    "return_10d",
+    # Volume features
     "volume_change",
+    "volume_ma_ratio",
+    "obv_change",
+    # Momentum features
     "rsi_14",
     "macd",
     "macd_signal",
     "macd_diff",
+    "rolling_sharpe_20",
+    # Volatility features
     "volatility_10",
+    "atr_14",
+    "bollinger_band_width",
+    # Market context features
     "spy_log_return",
     "vix_close",
     "vix_log_return",
+    "relative_strength",
+    # Calendar features
+    "day_of_week",
+    # Targets
     "target_next_day_return",
+    "target_5d_return",
 ]
 
 
-# ── Data loading ───────────────────────────────────────────────────────────────
-
 def load_price_data(csv_path: Path) -> pd.DataFrame:
-    """
-    Read one raw CSV file, parse Date as datetime, and sort ascending by Date.
-    Raises ValueError if required columns are missing or dates are invalid.
-    """
+    """Read raw CSV, parse dates, sort ascending. Validates required columns."""
     df = pd.read_csv(csv_path)
 
-    required = {"Date", "Adj Close", "Volume"}
+    required = {"Date", "Open", "High", "Low", "Close", "Adj Close", "Volume"}
     missing = required.difference(df.columns)
     if missing:
         raise ValueError(f"[{csv_path.name}] Missing required columns: {sorted(missing)}")
@@ -74,15 +99,8 @@ def load_price_data(csv_path: Path) -> pd.DataFrame:
     return df.sort_values("Date").reset_index(drop=True)
 
 
-# ── Market feature builders ────────────────────────────────────────────────────
-
 def build_spy_features(spy_path: Path) -> pd.DataFrame:
-    """
-    Compute daily log return from SPY Adj Close.
-    Used as a market direction proxy — tells the model whether the broad
-    market moved up or down on a given day.
-    Returns a DataFrame with columns [Date, spy_log_return].
-    """
+    """Compute daily log return from SPY Adj Close. Used for market direction."""
     df = load_price_data(spy_path)
     price = df["Adj Close"].astype(float)
     df["spy_log_return"] = np.log(price / price.shift(1))
@@ -90,20 +108,13 @@ def build_spy_features(spy_path: Path) -> pd.DataFrame:
 
 
 def build_vix_features(vix_path: Path) -> pd.DataFrame:
-    """
-    Extract VIX level and its daily log return.
-    VIX level captures the current fear/volatility regime.
-    VIX log return captures how quickly fear is rising or falling.
-    Returns a DataFrame with columns [Date, vix_close, vix_log_return].
-    """
+    """Extract VIX level and its daily log return — captures fear regime."""
     df = load_price_data(vix_path)
     price = df["Adj Close"].astype(float)
     df["vix_close"]      = price
     df["vix_log_return"] = np.log(price / price.shift(1))
     return df[["Date", "vix_close", "vix_log_return"]]
 
-
-# ── Per-stock feature engineering ─────────────────────────────────────────────
 
 def engineer_stock_features(
     stock_path: Path,
@@ -113,45 +124,52 @@ def engineer_stock_features(
     """
     Build the full feature set for one stock and merge market context.
 
-    Features created:
-        log_return      — daily price movement signal
-        volume_change   — trading activity change vs previous day
-        rsi_14          — 14-day momentum / overbought-oversold indicator
-        macd            — trend strength from moving average crossover
-        macd_signal     — smoothed MACD line
-        macd_diff       — gap between MACD and signal (momentum turning point)
-        volatility_10   — 10-day rolling std of log returns (recent risk)
-        spy_log_return  — broad market direction (merged from SPY)
-        vix_close       — current fear/volatility regime (merged from VIX)
-        vix_log_return  — rate of change in market fear (merged from VIX)
-
-    Target:
-        target_next_day_return — next day's log return, created by shifting
-                                 log_return forward by one day. Today's
-                                 features predict tomorrow's return.
-
-    Rows with NaNs (from rolling windows and the target shift) are dropped.
-    Returns a DataFrame with columns matching OUTPUT_COLUMNS.
+    19 input features cover price, volume, momentum, volatility,
+    market context, and calendar effects. Two targets are produced:
+    next-day return and 5-day forward cumulative return.
     """
     df     = load_price_data(stock_path)
     ticker = stock_path.stem
 
     price  = df["Adj Close"].astype(float)
+    high   = df["High"].astype(float)
+    low    = df["Low"].astype(float)
+    close  = df["Close"].astype(float)
     volume = df["Volume"].astype(float)
 
     features = pd.DataFrame()
-    features["Date"]   = df["Date"]
-    features["ticker"] = ticker
+    features["Date"]      = df["Date"]
+    features["ticker"]    = ticker
     features["adj_close"] = price
     features["volume"]    = volume
 
-    # Price movement
+    # ── Price features ─────────────────────────────────────────────────────────
+
     features["log_return"] = np.log(price / price.shift(1))
+    features["return_5d"]  = features["log_return"].rolling(window=5).sum()
+    features["return_10d"] = features["log_return"].rolling(window=10).sum()
 
-    # Trading activity
-    features["volume_change"] = volume.pct_change()
+    # ── Volume features ────────────────────────────────────────────────────────
 
-    # Momentum indicators
+    raw_volume_change = volume.pct_change()
+    lower = raw_volume_change.quantile(0.01)
+    upper = raw_volume_change.quantile(0.99)
+    features["volume_change"] = raw_volume_change.clip(lower=lower, upper=upper)
+
+    volume_ma_20 = volume.rolling(window=20).mean()
+    features["volume_ma_ratio"] = volume / volume_ma_20
+
+    obv_direction = np.where(price > price.shift(1), volume,
+                    np.where(price < price.shift(1), -volume, 0))
+    obv = pd.Series(obv_direction, index=df.index).cumsum()
+    features["obv_change"] = obv.pct_change()
+
+    obv_lower = features["obv_change"].quantile(0.01)
+    obv_upper = features["obv_change"].quantile(0.99)
+    features["obv_change"] = features["obv_change"].clip(lower=obv_lower, upper=obv_upper)
+
+    # ── Momentum features ──────────────────────────────────────────────────────
+
     features["rsi_14"] = RSIIndicator(close=price, window=14).rsi()
 
     macd_ind = MACD(close=price, window_slow=26, window_fast=12, window_sign=9)
@@ -159,17 +177,47 @@ def engineer_stock_features(
     features["macd_signal"] = macd_ind.macd_signal()
     features["macd_diff"]   = macd_ind.macd_diff()
 
-    # Recent volatility (risk)
+    # 20-day rolling Sharpe ratio — risk-adjusted momentum signal
+    rolling_mean = features["log_return"].rolling(window=20).mean()
+    rolling_std  = features["log_return"].rolling(window=20).std()
+    features["rolling_sharpe_20"] = rolling_mean / rolling_std
+
+    # ── Volatility features ────────────────────────────────────────────────────
+
     features["volatility_10"] = features["log_return"].rolling(window=10).std()
 
-    # Target: next-day return (shift by -1 so today's row predicts tomorrow)
-    features["target_next_day_return"] = features["log_return"].shift(-1)
+    atr = AverageTrueRange(high=high, low=low, close=close, window=14)
+    features["atr_14"] = atr.average_true_range()
 
-    # Merge market-level features by date
+    bb = BollingerBands(close=price, window=20, window_dev=2)
+    bb_upper  = bb.bollinger_hband()
+    bb_lower  = bb.bollinger_lband()
+    bb_middle = bb.bollinger_mavg()
+    features["bollinger_band_width"] = (bb_upper - bb_lower) / bb_middle
+
+    # ── Targets ────────────────────────────────────────────────────────────────
+
+    features["target_next_day_return"] = features["log_return"].shift(-1)
+    features["target_5d_return"] = features["log_return"].rolling(window=5).sum().shift(-5)
+
+    # ── Merge market features ──────────────────────────────────────────────────
+
     features = features.merge(spy_features, on="Date", how="left")
     features = features.merge(vix_features, on="Date", how="left")
 
-    # Drop rows with any NaN (rolling window warmup + target shift)
+    # ── Cross-market features ──────────────────────────────────────────────────
+
+    # Relative strength: stock return minus market return
+    # Captures whether the stock is outperforming or underperforming SPY
+    features["relative_strength"] = features["log_return"] - features["spy_log_return"]
+
+    # ── Calendar features ──────────────────────────────────────────────────────
+
+    # Day of week: 0=Monday, 4=Friday. Captures weekday effects.
+    features["day_of_week"] = features["Date"].dt.dayofweek
+
+    # ── Clean up ───────────────────────────────────────────────────────────────
+
     features = features.replace([np.inf, -np.inf], np.nan)
     features = features.dropna().reset_index(drop=True)
 
@@ -181,18 +229,8 @@ def engineer_stock_features(
     return features[OUTPUT_COLUMNS]
 
 
-# ── Main pipeline ──────────────────────────────────────────────────────────────
-
 def main() -> None:
-    """
-    Run the full feature engineering pipeline for all stocks.
-
-    Steps:
-        1. Load SPY and VIX market features once.
-        2. Process each stock file in data/raw/ individually.
-        3. Save one processed CSV per stock to data/processed/.
-        4. Concatenate all stocks into data/final_model_dataset.csv.
-    """
+    """Run the full feature engineering pipeline for all stocks."""
     if not RAW_DATA_DIR.exists():
         raise SystemExit(f"Raw data directory not found: {RAW_DATA_DIR}")
 
@@ -235,7 +273,6 @@ def main() -> None:
             failed.append((ticker, str(error)))
             print(f"  FAIL {ticker:<6}  {error}")
 
-    # Combine all processed stocks into one final dataset
     if successful:
         final = pd.concat(successful, ignore_index=True)
         final = final.sort_values(["Date", "ticker"]).reset_index(drop=True)
@@ -244,10 +281,13 @@ def main() -> None:
 
     final.to_csv(FINAL_DATASET_PATH, index=False)
 
+    n_features = len(OUTPUT_COLUMNS) - 6  # minus Date, ticker, adj_close, volume, 2 targets
+
     print("\n── Feature engineering summary ───────────────────────")
     print(f"Successful : {len(successful)} / {len(stock_files)}")
     print(f"Failed     : {len(failed)}")
     print(f"Total rows : {len(final)}")
+    print(f"Features   : {n_features} input + 2 targets")
     print(f"Saved to   : {FINAL_DATASET_PATH}")
 
     if failed:
