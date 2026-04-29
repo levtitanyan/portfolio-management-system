@@ -98,3 +98,25 @@ Data source: Yahoo Finance via `yfinance` — period: 2015-01-01 to 2025-01-01
 - [ ] GRU
 - [ ] TCN
 - [ ] Portfolio backtesting
+
+
+
+# Run from scratch
+
+```zsh
+rm -rf data/ outputs/
+
+python src/dataset/1_download_yahoo_data.py
+
+python src/dataset/2_build_features.py
+
+python src/dataset/3_prepare_model_data.py
+
+python src/models/4_train_baselines.py
+
+python src/models/5_train_lstm.py
+
+python src/models/6_train_gru.py
+
+
+```

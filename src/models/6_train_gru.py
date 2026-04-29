@@ -1,12 +1,19 @@
 """
-Train a GRU model for next-day stock return prediction.
+Train GRU model with BOTH default and tuned configurations.
 
-Identical architecture to the LSTM but replaces the LSTM cell with a GRU cell.
-GRU has fewer parameters than LSTM which can help on smaller datasets.
-Reuses the scaler and ticker map saved by 5_train_lstm.py.
+Output structure:
+    outputs/gru/default/
+        config.json
+        metrics_1d.json, metrics_5d.json
+        per_ticker_1d.csv, per_ticker_5d.csv
+        predictions_1d_test.csv, predictions_5d_test.csv
+        model_1d.pt, model_5d.pt
+    outputs/gru/tuned/     (only if gru_best_config.json exists)
+        same structure
 
-Run from the project root:
-    python src/models/6_train_gru.py
+Reuses scaler.pkl and ticker_map.json from outputs/shared/.
+
+Run:  python src/models/6_train_gru.py
 """
 
 from pathlib import Path
@@ -22,455 +29,301 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 import joblib
 
 
-# ── Paths ──────────────────────────────────────────────────────────────────────
+BASE_DIR    = Path(__file__).resolve().parents[2]
+TRAIN_PATH  = BASE_DIR / "data" / "splits" / "train.csv"
+VAL_PATH    = BASE_DIR / "data" / "splits" / "val.csv"
+TEST_PATH   = BASE_DIR / "data" / "splits" / "test.csv"
+OUTPUT_BASE = BASE_DIR / "outputs" / "gru"
+SHARED_DIR  = BASE_DIR / "outputs" / "shared"
+TUNED_CFG   = SHARED_DIR / "gru_best_config.json"
 
-BASE_DIR        = Path(__file__).resolve().parents[2]
-TRAIN_PATH      = BASE_DIR / "data" / "splits" / "train.csv"
-VAL_PATH        = BASE_DIR / "data" / "splits" / "val.csv"
-TEST_PATH       = BASE_DIR / "data" / "splits" / "test.csv"
-METRICS_DIR     = BASE_DIR / "outputs" / "metrics"
-PREDICTIONS_DIR = BASE_DIR / "outputs" / "predictions"
-MODELS_DIR      = BASE_DIR / "outputs" / "models"
+RANDOM_SEED = 42
+INITIAL_CAPITAL       = 10_000.0
+TOP_K_LONGS           = 5
+BOTTOM_K_SHORTS       = 5
+TRADING_DAYS_PER_YEAR = 252
 
-SCALER_PATH     = MODELS_DIR / "scaler.pkl"
-TICKER_MAP_PATH = MODELS_DIR / "ticker_map.json"
+DEFAULT_CONFIG = {
+    "lookback": 20, "hidden_size": 128, "num_layers": 2, "dropout": 0.2,
+    "batch_size": 64, "learning_rate": 5e-4, "max_epochs": 50, "patience": 10,
+    "embedding_dim": 8,
+}
 
-# ── Configuration ──────────────────────────────────────────────────────────────
-
-LOOKBACK        = 20
-HIDDEN_SIZE     = 128
-NUM_LAYERS      = 2
-DROPOUT         = 0.2
-BATCH_SIZE      = 64
-LEARNING_RATE   = 5e-4
-MAX_EPOCHS      = 50
-PATIENCE        = 10
-RANDOM_SEED     = 42
-EMBEDDING_DIM   = 8
-
-# ── Columns ────────────────────────────────────────────────────────────────────
-
-TARGET_COLUMN = "target_next_day_return"
+TARGET_COLUMNS = ["target_next_day_return", "target_5d_return"]
 FEATURE_COLUMNS = [
-    "log_return",
-    "volume_change",
-    "rsi_14",
-    "macd",
-    "macd_signal",
-    "macd_diff",
-    "volatility_10",
-    "spy_log_return",
-    "vix_close",
-    "vix_log_return",
+    "log_return", "return_5d", "return_10d",
+    "volume_change", "volume_ma_ratio", "obv_change",
+    "rsi_14", "macd", "macd_signal", "macd_diff", "rolling_sharpe_20",
+    "volatility_10", "atr_14", "bollinger_band_width",
+    "spy_log_return", "vix_close", "vix_log_return", "relative_strength",
+    "day_of_week",
 ]
 
 
 # ── Device ─────────────────────────────────────────────────────────────────────
 
-def get_device() -> torch.device:
-    """Select MPS (Apple Silicon), CUDA, or CPU in that order."""
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    if torch.cuda.is_available():
-        return torch.device("cuda")
+def get_device():
+    if torch.cuda.is_available(): return torch.device("cuda")
+    if torch.backends.mps.is_available(): return torch.device("mps")
     return torch.device("cpu")
 
 
-# ── Data loading ───────────────────────────────────────────────────────────────
+# ── Data ───────────────────────────────────────────────────────────────────────
 
-def load_split(csv_path: Path) -> pd.DataFrame:
-    """Load one split CSV, parse dates, sort by ticker and Date."""
-    df = pd.read_csv(csv_path)
-    df["Date"] = pd.to_datetime(df["Date"])
+def load_split(path):
+    df = pd.read_csv(path); df["Date"] = pd.to_datetime(df["Date"])
     return df.sort_values(["ticker", "Date"]).reset_index(drop=True)
 
+def build_ticker_map(df):
+    return {t: i for i, t in enumerate(sorted(df["ticker"].unique()))}
 
-# ── Sequence builder ───────────────────────────────────────────────────────────
-
-def build_sequences(
-    df: pd.DataFrame,
-    scaler: StandardScaler,
-    ticker_map: dict[str, int],
-    lookback: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Convert a flat DataFrame into (X, ticker_ids, y) arrays.
-    Scaler is already fitted — only transform is applied here.
-    Sequences are never built across ticker boundaries.
-
-    Returns:
-        X          : float32 array of shape (n_samples, lookback, n_features)
-        ticker_ids : int64 array of shape (n_samples,)
-        y          : float32 array of shape (n_samples,)
-    """
-    features        = df[FEATURE_COLUMNS].values.astype(np.float32)
-    features_scaled = scaler.transform(features).astype(np.float32)
-    targets         = df[TARGET_COLUMN].values.astype(np.float32)
-
-    df = df.reset_index(drop=True)
-    df["_idx"] = df.index
-
-    X_list, ticker_list, y_list = [], [], []
-
-    for ticker, group in df.groupby("ticker"):
-        idx            = group["_idx"].values
-        ticker_id      = ticker_map.get(ticker, 0)
-        ticker_feats   = features_scaled[idx]
-        ticker_targets = targets[idx]
-
-        for i in range(lookback, len(ticker_feats)):
-            X_list.append(ticker_feats[i - lookback : i])
-            ticker_list.append(ticker_id)
-            y_list.append(ticker_targets[i])
-
-    return (
-        np.array(X_list,      dtype=np.float32),
-        np.array(ticker_list, dtype=np.int64),
-        np.array(y_list,      dtype=np.float32),
-    )
+def build_sequences(df, scaler, ticker_map, target, lookback, fit=False):
+    feats = df[FEATURE_COLUMNS].values.astype(np.float32)
+    if fit: scaler.fit(feats)
+    fs = scaler.transform(feats).astype(np.float32)
+    tgts = df[target].values.astype(np.float32)
+    df = df.reset_index(drop=True); df["_i"] = df.index
+    X, T, Y = [], [], []
+    for tk, g in df.groupby("ticker"):
+        idx = g["_i"].values; tid = ticker_map.get(tk, 0)
+        tf, tt = fs[idx], tgts[idx]
+        for i in range(lookback, len(tf)):
+            X.append(tf[i-lookback:i]); T.append(tid); Y.append(tt[i])
+    return np.array(X, dtype=np.float32), np.array(T, dtype=np.int64), np.array(Y, dtype=np.float32)
 
 
-# ── PyTorch Dataset ────────────────────────────────────────────────────────────
-
-class ReturnSequenceDataset(Dataset):
-    """Wraps (X, ticker_ids, y) arrays as a PyTorch Dataset."""
-
-    def __init__(
-        self,
-        X: np.ndarray,
-        ticker_ids: np.ndarray,
-        y: np.ndarray,
-    ) -> None:
-        self.X          = torch.tensor(X,          dtype=torch.float32)
-        self.ticker_ids = torch.tensor(ticker_ids, dtype=torch.long)
-        self.y          = torch.tensor(y,          dtype=torch.float32)
-
-    def __len__(self) -> int:
-        return len(self.y)
-
-    def __getitem__(
-        self, idx: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self.X[idx], self.ticker_ids[idx], self.y[idx]
+class SeqDS(Dataset):
+    def __init__(self, X, T, Y):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.T = torch.tensor(T, dtype=torch.long)
+        self.Y = torch.tensor(Y, dtype=torch.float32)
+    def __len__(self): return len(self.Y)
+    def __getitem__(self, i): return self.X[i], self.T[i], self.Y[i]
 
 
-# ── GRU Model ──────────────────────────────────────────────────────────────────
+# ── Model ──────────────────────────────────────────────────────────────────────
 
 class GRUModel(nn.Module):
     """
-    Stacked GRU with ticker embedding for return prediction.
-
-    GRU differs from LSTM in that it uses two gates (reset and update)
-    instead of three (input, forget, output). This means fewer parameters,
-    which can reduce overfitting on smaller datasets.
-
-    Architecture:
-        ticker_id → Embedding(n_tickers, embedding_dim)
-        embedding repeated across timesteps and concatenated with features
-        → GRU(input_size + embedding_dim, hidden_size, num_layers)
-        → take last timestep output
-        → Linear(hidden_size, 1)
-        → scalar return prediction
+    Stacked GRU with ticker embedding.
+    GRU has fewer parameters than LSTM (2 gates instead of 3),
+    which can help on smaller noisy datasets.
     """
-
-    def __init__(
-        self,
-        input_size: int,
-        hidden_size: int,
-        num_layers: int,
-        dropout: float,
-        n_tickers: int,
-        embedding_dim: int,
-    ) -> None:
+    def __init__(self, input_size, hidden_size, num_layers, dropout, n_tickers, embedding_dim):
         super().__init__()
-
-        self.ticker_embedding = nn.Embedding(n_tickers, embedding_dim)
-
-        self.gru = nn.GRU(
-            input_size  = input_size + embedding_dim,
-            hidden_size = hidden_size,
-            num_layers  = num_layers,
-            dropout     = dropout if num_layers > 1 else 0.0,
-            batch_first = True,
-        )
+        self.emb = nn.Embedding(n_tickers, embedding_dim)
+        self.gru = nn.GRU(input_size + embedding_dim, hidden_size, num_layers,
+                          dropout=dropout if num_layers > 1 else 0.0, batch_first=True)
         self.fc = nn.Linear(hidden_size, 1)
-
-    def forward(
-        self, x: torch.Tensor, ticker_ids: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        x          : (batch, lookback, n_features)
-        ticker_ids : (batch,)
-        output     : (batch,)
-        """
-        emb          = self.ticker_embedding(ticker_ids)
-        emb_expanded = emb.unsqueeze(1).expand(-1, x.size(1), -1)
-        x_combined   = torch.cat([x, emb_expanded], dim=-1)
-
-        gru_out, _  = self.gru(x_combined)
-        last_step   = gru_out[:, -1, :]
-        return self.fc(last_step).squeeze(-1)
+    def forward(self, x, tid):
+        e = self.emb(tid).unsqueeze(1).expand(-1, x.size(1), -1)
+        out, _ = self.gru(torch.cat([x, e], dim=-1))
+        return self.fc(out[:, -1, :]).squeeze(-1)
 
 
 # ── Metrics ────────────────────────────────────────────────────────────────────
 
-def directional_accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """Fraction of predictions where predicted sign matches true sign."""
-    return float((np.sign(y_true) == np.sign(y_pred)).mean())
+def dir_acc(yt, yp): return float((np.sign(yt) == np.sign(yp)).mean())
+def compute_metrics(yt, yp):
+    return {"mae": float(mean_absolute_error(yt, yp)),
+            "rmse": float(np.sqrt(mean_squared_error(yt, yp))),
+            "directional_accuracy": dir_acc(yt, yp)}
+
+def per_ticker_metrics(df, preds, target):
+    df = df.copy(); df["y_pred"] = preds
+    return {t: compute_metrics(g[target].to_numpy(), g["y_pred"].to_numpy()) for t, g in df.groupby("ticker")}
+
+def save_per_ticker_csv(pt, path):
+    pd.DataFrame([{"ticker": t, **m} for t, m in sorted(pt.items())]).to_csv(path, index=False)
 
 
-def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
-    """Compute MAE, RMSE, and directional accuracy."""
-    return {
-        "mae":  float(mean_absolute_error(y_true, y_pred)),
-        "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
-        "directional_accuracy": directional_accuracy(y_true, y_pred),
-    }
+# ── Backtest ───────────────────────────────────────────────────────────────────
+
+def sharpe(r):
+    return float(r.mean() / r.std() * np.sqrt(TRADING_DAYS_PER_YEAR)) if len(r) > 0 and r.std() > 0 else 0.0
+def max_dd(eq):
+    pk = np.maximum.accumulate(eq); return float(((eq - pk) / pk).min()) if len(eq) > 0 else 0.0
+
+def run_backtest(df, preds, target):
+    df = df.copy(); df["y_pred"] = preds; df["y_true"] = df[target]
+    lo, ls, bh = [], [], []
+    for _, g in df.groupby("Date"):
+        if len(g) < TOP_K_LONGS + BOTTOM_K_SHORTS: continue
+        s = g.sort_values("y_pred", ascending=False)
+        t = s.head(TOP_K_LONGS)["y_true"].mean()
+        b = s.tail(BOTTOM_K_SHORTS)["y_true"].mean()
+        lo.append(t); ls.append((t-b)/2.0); bh.append(g["y_true"].mean())
+    if not lo: return {"error": "No data"}
+    def _b(r):
+        si = np.exp(np.array(r))-1; eq = INITIAL_CAPITAL*np.cumprod(1+si)
+        return {"final_value": float(eq[-1]), "total_return": float(eq[-1]/INITIAL_CAPITAL-1),
+                "sharpe_ratio": sharpe(si), "max_drawdown": max_dd(eq), "n_trading_days": len(si)}
+    return {"long_only": _b(lo), "long_short": _b(ls), "buy_and_hold_benchmark": _b(bh)}
 
 
-# ── Training loop ──────────────────────────────────────────────────────────────
+# ── Training ───────────────────────────────────────────────────────────────────
 
-def train_epoch(
-    model: nn.Module,
-    loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    criterion: nn.Module,
-    device: torch.device,
-) -> float:
-    """Run one full training epoch and return mean loss."""
-    model.train()
-    total_loss = 0.0
+def train_epoch(model, loader, opt, crit, device):
+    model.train(); total = 0.0
+    for X, T, Y in loader:
+        X, T, Y = X.to(device), T.to(device), Y.to(device)
+        opt.zero_grad(); loss = crit(model(X, T), Y); loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
+        total += loss.item() * len(Y)
+    return total / len(loader.dataset)
 
-    for X_batch, ticker_batch, y_batch in loader:
-        X_batch      = X_batch.to(device)
-        ticker_batch = ticker_batch.to(device)
-        y_batch      = y_batch.to(device)
-
-        optimizer.zero_grad()
-        predictions = model(X_batch, ticker_batch)
-        loss        = criterion(predictions, y_batch)
-        loss.backward()
-
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-        optimizer.step()
-        total_loss += loss.item() * len(y_batch)
-
-    return total_loss / len(loader.dataset)
-
-
-def evaluate(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: nn.Module,
-    device: torch.device,
-) -> tuple[float, np.ndarray]:
-    """Run inference on a DataLoader and return (mean_loss, predictions)."""
-    model.eval()
-    total_loss = 0.0
-    all_preds  = []
-
+def evaluate(model, loader, crit, device):
+    model.eval(); total, preds = 0.0, []
     with torch.no_grad():
-        for X_batch, ticker_batch, y_batch in loader:
-            X_batch      = X_batch.to(device)
-            ticker_batch = ticker_batch.to(device)
-            y_batch      = y_batch.to(device)
+        for X, T, Y in loader:
+            X, T, Y = X.to(device), T.to(device), Y.to(device)
+            p = model(X, T); total += crit(p, Y).item()*len(Y); preds.append(p.cpu().numpy())
+    return total/len(loader.dataset), np.concatenate(preds)
 
-            preds = model(X_batch, ticker_batch)
-            loss  = criterion(preds, y_batch)
+def align_preds(split_df, preds, lookback, target):
+    rows = []
+    for _, g in split_df.groupby("ticker"):
+        rows.append(g.iloc[lookback:][["Date", "ticker", target]])
+    ref = pd.concat(rows).reset_index(drop=True)
+    ref["y_true"] = ref[target].values; ref["y_pred"] = preds
+    return ref[["Date", "ticker", "y_true", "y_pred"]]
 
-            total_loss += loss.item() * len(y_batch)
-            all_preds.append(preds.cpu().numpy())
 
-    return total_loss / len(loader.dataset), np.concatenate(all_preds)
+# ── Print helpers ──────────────────────────────────────────────────────────────
+
+def print_results(label, train_m, val_m, test_m, bt):
+    print(f"\n  {label} — Statistical Metrics:")
+    print(f"  {'Split':<12} {'MAE':<12} {'RMSE':<12} {'Dir Acc'}")
+    print(f"  {'─'*12} {'─'*12} {'─'*12} {'─'*10}")
+    for n, m in [("Train", train_m), ("Validation", val_m), ("Test", test_m)]:
+        print(f"  {n:<12} {m['mae']:<12.6f} {m['rmse']:<12.6f} {m['directional_accuracy']:.4f}")
+    if "error" not in bt:
+        lo, ls, bh = bt["long_only"], bt["long_short"], bt["buy_and_hold_benchmark"]
+        print(f"\n  Backtest (${INITIAL_CAPITAL:,.0f}):")
+        print(f"    Long Only:    ${lo['final_value']:>9,.0f} ({lo['total_return']*100:+.1f}%)  Sharpe: {lo['sharpe_ratio']:.3f}  MaxDD: {lo['max_drawdown']*100:+.1f}%")
+        print(f"    Long-Short:   ${ls['final_value']:>9,.0f} ({ls['total_return']*100:+.1f}%)  Sharpe: {ls['sharpe_ratio']:.3f}  MaxDD: {ls['max_drawdown']*100:+.1f}%")
+        print(f"    Buy-and-Hold: ${bh['final_value']:>9,.0f} ({bh['total_return']*100:+.1f}%)  Sharpe: {bh['sharpe_ratio']:.3f}  MaxDD: {bh['max_drawdown']*100:+.1f}%")
+
+
+# ── Run one config ─────────────────────────────────────────────────────────────
+
+def run_gru(config, config_name, out_dir, train_df, val_df, test_df, ticker_map, device):
+    """Train GRU with given config on both targets, save everything to out_dir."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    n_tickers = len(ticker_map)
+    lookback  = config["lookback"]
+
+    with open(out_dir / "config.json", "w") as f:
+        json.dump(config, f, indent=2)
+
+    print(f"\n{'='*60}")
+    print(f"  GRU — {config_name}")
+    print(f"  Config: h={config['hidden_size']} L={config['num_layers']} "
+          f"lr={config['learning_rate']} d={config['dropout']}")
+    print(f"{'='*60}")
+
+    for target in TARGET_COLUMNS:
+        sfx = "1d" if "next_day" in target else "5d"
+        tgt_label = "1-DAY" if sfx == "1d" else "5-DAY"
+
+        print(f"\n── {tgt_label} TARGET ──────────────────────────────────")
+
+        scaler = StandardScaler()
+        X_tr, T_tr, Y_tr = build_sequences(train_df, scaler, ticker_map, target, lookback, fit=True)
+        X_va, T_va, Y_va = build_sequences(val_df,   scaler, ticker_map, target, lookback)
+        X_te, T_te, Y_te = build_sequences(test_df,  scaler, ticker_map, target, lookback)
+
+        print(f"  Train: {X_tr.shape}  Val: {X_va.shape}  Test: {X_te.shape}")
+
+        tr_loader = DataLoader(SeqDS(X_tr, T_tr, Y_tr), batch_size=config["batch_size"], shuffle=True)
+        va_loader = DataLoader(SeqDS(X_va, T_va, Y_va), batch_size=config["batch_size"], shuffle=False)
+        te_loader = DataLoader(SeqDS(X_te, T_te, Y_te), batch_size=config["batch_size"], shuffle=False)
+
+        model = GRUModel(len(FEATURE_COLUMNS), config["hidden_size"], config["num_layers"],
+                         config["dropout"], n_tickers, config["embedding_dim"]).to(device)
+        opt = torch.optim.Adam(model.parameters(), lr=config["learning_rate"])
+        sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=3)
+        crit = nn.MSELoss()
+
+        best_val, no_imp = float("inf"), 0
+        model_path = out_dir / f"model_{sfx}.pt"
+
+        print(f"  Training (max {config['max_epochs']} ep, patience={config['patience']})...")
+
+        for ep in range(1, config["max_epochs"] + 1):
+            tl = train_epoch(model, tr_loader, opt, crit, device)
+            vl, _ = evaluate(model, va_loader, crit, device)
+            sched.step(vl)
+            if ep % 5 == 0 or ep == 1:
+                print(f"    Epoch {ep:>3}  train={tl:.6f}  val={vl:.6f}")
+            if vl < best_val:
+                best_val = vl; no_imp = 0; torch.save(model.state_dict(), model_path)
+            else:
+                no_imp += 1
+                if no_imp >= config["patience"]:
+                    print(f"    Early stopping at epoch {ep}"); break
+
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        _, tr_p = evaluate(model, tr_loader, crit, device)
+        _, va_p = evaluate(model, va_loader, crit, device)
+        _, te_p = evaluate(model, te_loader, crit, device)
+
+        tr_m = compute_metrics(Y_tr, tr_p)
+        va_m = compute_metrics(Y_va, va_p)
+        te_m = compute_metrics(Y_te, te_p)
+
+        te_aligned = align_preds(test_df, te_p, lookback, target)
+        bt = run_backtest(te_aligned, te_aligned["y_pred"].values, "y_true")
+
+        print_results(f"GRU {config_name} {tgt_label}", tr_m, va_m, te_m, bt)
+
+        pt = per_ticker_metrics(te_aligned.rename(columns={"y_true": target}), te_p, target)
+        save_per_ticker_csv(pt, out_dir / f"per_ticker_{sfx}.csv")
+
+        for sname, sdf, sp in [("train", train_df, tr_p), ("val", val_df, va_p), ("test", test_df, te_p)]:
+            al = align_preds(sdf, sp, lookback, target)
+            al.to_csv(out_dir / f"predictions_{sfx}_{sname}.csv", index=False)
+
+        results = {"model": f"gru_{config_name}", "target": target, "config": config,
+                   "train": tr_m, "validation": va_m, "test": te_m, "test_backtest": bt}
+        with open(out_dir / f"metrics_{sfx}.json", "w") as f:
+            json.dump(results, f, indent=2)
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
-def main() -> None:
-    """
-    Full GRU training pipeline:
-        1. Load splits, scaler, and ticker map from LSTM run
-        2. Build sequences using the same scaler — no refitting
-        3. Train with early stopping on validation loss
-        4. Evaluate on train, val, and test
-        5. Save model, metrics, and predictions
-    """
-    torch.manual_seed(RANDOM_SEED)
-    np.random.seed(RANDOM_SEED)
-
-    METRICS_DIR.mkdir(parents=True, exist_ok=True)
-    PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+def main():
+    torch.manual_seed(RANDOM_SEED); np.random.seed(RANDOM_SEED)
+    SHARED_DIR.mkdir(parents=True, exist_ok=True)
 
     device = get_device()
     print(f"Device: {device}")
 
-    # ── Load scaler and ticker map from LSTM run ───────────────────────────────
-    if not SCALER_PATH.exists():
-        raise FileNotFoundError(
-            f"Scaler not found at {SCALER_PATH}. "
-            "Run 5_train_lstm.py first."
-        )
-    if not TICKER_MAP_PATH.exists():
-        raise FileNotFoundError(
-            f"Ticker map not found at {TICKER_MAP_PATH}. "
-            "Run 5_train_lstm.py first."
-        )
-
-    scaler     = joblib.load(SCALER_PATH)
-    ticker_map = json.load(open(TICKER_MAP_PATH))
-    n_tickers  = len(ticker_map)
-    print(f"Loaded scaler from  : {SCALER_PATH}")
-    print(f"Loaded ticker map   : {n_tickers} tickers")
-
-    # ── Load data ──────────────────────────────────────────────────────────────
-    print("Loading splits...")
     train_df = load_split(TRAIN_PATH)
     val_df   = load_split(VAL_PATH)
     test_df  = load_split(TEST_PATH)
 
-    # ── Build sequences ────────────────────────────────────────────────────────
-    print("Building sequences...")
-    X_train, tid_train, y_train = build_sequences(train_df, scaler, ticker_map, LOOKBACK)
-    X_val,   tid_val,   y_val   = build_sequences(val_df,   scaler, ticker_map, LOOKBACK)
-    X_test,  tid_test,  y_test  = build_sequences(test_df,  scaler, ticker_map, LOOKBACK)
+    ticker_map = build_ticker_map(train_df)
 
-    print(f"  Train : {X_train.shape}")
-    print(f"  Val   : {X_val.shape}")
-    print(f"  Test  : {X_test.shape}")
+    # Default config
+    run_gru(DEFAULT_CONFIG, "default", OUTPUT_BASE / "default",
+            train_df, val_df, test_df, ticker_map, device)
 
-    # ── DataLoaders ────────────────────────────────────────────────────────────
-    train_loader = DataLoader(
-        ReturnSequenceDataset(X_train, tid_train, y_train),
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-    )
-    val_loader = DataLoader(
-        ReturnSequenceDataset(X_val, tid_val, y_val),
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-    )
-    test_loader = DataLoader(
-        ReturnSequenceDataset(X_test, tid_test, y_test),
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-    )
+    # Tuned config (if exists)
+    if TUNED_CFG.exists():
+        with open(TUNED_CFG) as f:
+            tuned_config = json.load(f)
+        tuned_config.setdefault("max_epochs", 50)
+        tuned_config.setdefault("patience", 10)
+        tuned_config.setdefault("embedding_dim", 8)
 
-    # ── Model ──────────────────────────────────────────────────────────────────
-    model = GRUModel(
-        input_size    = len(FEATURE_COLUMNS),
-        hidden_size   = HIDDEN_SIZE,
-        num_layers    = NUM_LAYERS,
-        dropout       = DROPOUT,
-        n_tickers     = n_tickers,
-        embedding_dim = EMBEDDING_DIM,
-    ).to(device)
+        run_gru(tuned_config, "tuned", OUTPUT_BASE / "tuned",
+                train_df, val_df, test_df, ticker_map, device)
+    else:
+        print(f"\n  No tuned config found at {TUNED_CFG}")
+        print(f"  Run tune_gru.py on Colab, then place gru_best_config.json in outputs/shared/")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    criterion = nn.MSELoss()
-
-    print(f"\nModel architecture:\n{model}\n")
-
-    # ── Training with early stopping ───────────────────────────────────────────
-    best_val_loss     = float("inf")
-    epochs_no_improve = 0
-    best_model_path   = MODELS_DIR / "gru_best.pt"
-
-    print(f"Training for up to {MAX_EPOCHS} epochs (patience={PATIENCE})...\n")
-
-    for epoch in range(1, MAX_EPOCHS + 1):
-        train_loss      = train_epoch(model, train_loader, optimizer, criterion, device)
-        val_loss, _     = evaluate(model, val_loader, criterion, device)
-
-        print(
-            f"Epoch {epoch:>3} / {MAX_EPOCHS}  "
-            f"train_loss={train_loss:.6f}  "
-            f"val_loss={val_loss:.6f}"
-        )
-
-        if val_loss < best_val_loss:
-            best_val_loss     = val_loss
-            epochs_no_improve = 0
-            torch.save(model.state_dict(), best_model_path)
-        else:
-            epochs_no_improve += 1
-            if epochs_no_improve >= PATIENCE:
-                print(f"\nEarly stopping at epoch {epoch}.")
-                break
-
-    # ── Evaluate best model ────────────────────────────────────────────────────
-    print(f"\nLoading best model from {best_model_path}")
-    model.load_state_dict(torch.load(best_model_path, map_location=device))
-
-    _, train_preds = evaluate(model, train_loader, criterion, device)
-    _, val_preds   = evaluate(model, val_loader,   criterion, device)
-    _, test_preds  = evaluate(model, test_loader,  criterion, device)
-
-    train_metrics = compute_metrics(y_train, train_preds)
-    val_metrics   = compute_metrics(y_val,   val_preds)
-    test_metrics  = compute_metrics(y_test,  test_preds)
-
-    # ── Print summary ──────────────────────────────────────────────────────────
-    print("\n── GRU Results ───────────────────────────────────────")
-    print(f"{'Split':<12} {'MAE':<12} {'RMSE':<12} {'Dir Acc'}")
-    print(f"{'─'*12} {'─'*12} {'─'*12} {'─'*10}")
-    for name, m in [
-        ("Train",      train_metrics),
-        ("Validation", val_metrics),
-        ("Test",       test_metrics),
-    ]:
-        print(
-            f"{name:<12} {m['mae']:<12.6f} {m['rmse']:<12.6f} "
-            f"{m['directional_accuracy']:.4f}"
-        )
-
-    # ── Save metrics ───────────────────────────────────────────────────────────
-    results = {
-        "model": "gru",
-        "config": {
-            "lookback":      LOOKBACK,
-            "hidden_size":   HIDDEN_SIZE,
-            "num_layers":    NUM_LAYERS,
-            "dropout":       DROPOUT,
-            "batch_size":    BATCH_SIZE,
-            "learning_rate": LEARNING_RATE,
-            "max_epochs":    MAX_EPOCHS,
-            "patience":      PATIENCE,
-            "embedding_dim": EMBEDDING_DIM,
-        },
-        "train":      train_metrics,
-        "validation": val_metrics,
-        "test":       test_metrics,
-    }
-
-    metrics_path = METRICS_DIR / "gru_metrics.json"
-    with open(metrics_path, "w") as f:
-        json.dump(results, f, indent=2)
-
-    # ── Save predictions ───────────────────────────────────────────────────────
-    for split_name, split_df, preds in [
-        ("train", train_df, train_preds),
-        ("val",   val_df,   val_preds),
-        ("test",  test_df,  test_preds),
-    ]:
-        ref_rows = []
-        for ticker, group in split_df.groupby("ticker"):
-            ref_rows.append(
-                group.iloc[LOOKBACK:][["Date", "ticker", TARGET_COLUMN]]
-            )
-
-        ref_df           = pd.concat(ref_rows).reset_index(drop=True)
-        ref_df["y_true"] = ref_df[TARGET_COLUMN].values
-        ref_df["y_pred"] = preds
-        ref_df           = ref_df[["Date", "ticker", "y_true", "y_pred"]]
-
-        out_path = PREDICTIONS_DIR / f"gru_{split_name}_predictions.csv"
-        ref_df.to_csv(out_path, index=False)
-
-    print(f"\nSaved metrics     : {metrics_path}")
-    print(f"Saved predictions : {PREDICTIONS_DIR}")
-    print(f"Saved model       : {best_model_path}")
+    print(f"\n  All GRU results saved to: {OUTPUT_BASE}")
 
 
 if __name__ == "__main__":
