@@ -125,5 +125,5 @@ python src/models/5_train_lstm.py
 python src/models/6_train_gru.py
 python src/models/7_train_tcn.py
 python src/models/99_gather_report.py
-
+python portfolio_backtest.py
 ```
