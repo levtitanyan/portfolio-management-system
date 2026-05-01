@@ -15,7 +15,7 @@ import yfinance as yf
 
 
 START_DATE = "2015-01-01"
-END_DATE = "2025-01-01"
+END_DATE = "2026-04-01"  # was "2025-01-01"
 OUTPUT_DIR = Path("data/raw")
 
 TICKERS = [

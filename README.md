@@ -25,6 +25,9 @@ python src/dataset/1_download_yahoo_data.py   # download raw data from Yahoo Fin
 python src/dataset/2_build_features.py        # engineer features
 python src/dataset/3_prepare_model_data.py    # split into train / val / test
 python src/models/4_train_baselines.py        # train and evaluate baseline models
+python src/models/5_train_lstm.py             # train and evaluate LSTM models
+python src/models/6_train_gru.py              # train and evaluate GRU models
+python src/models/99_gather_report.py         # gather all model outputs into reports
 ```
 
 ---
@@ -37,6 +40,9 @@ dataset/
 3_prepare_model_data.py    — chronological train / val / test split
 models/
 4_train_baselines.py       — Historical Mean, Naive, Linear Regression, Random Forest
+5_train_lstm.py            — LSTM default/tuned training and evaluation
+6_train_gru.py             — GRU default/tuned training and evaluation
+99_gather_report.py        — aggregate model and stock x model report tables
 data/
 raw/                         — one CSV per ticker from Yahoo Finance
 processed/                   — one feature CSV per stock
@@ -117,6 +123,7 @@ python src/models/4_train_baselines.py
 python src/models/5_train_lstm.py
 
 python src/models/6_train_gru.py
-
+python src/models/7_train_tcn.py
+python src/models/99_gather_report.py
 
 ```

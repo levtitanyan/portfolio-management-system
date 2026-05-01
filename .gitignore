@@ -28,6 +28,7 @@ env/
 # Whole Data
 data/
 outputs/
+Tuning/
 # Generated data outputs
 # data/processed/
 # data/final_model_dataset.csv
