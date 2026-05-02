@@ -1,35 +1,44 @@
 """
 Portfolio Backtest
 ==================
-Converts model predictions into a trading strategy and evaluates
+Simulates trading strategies using model predictions and evaluates
 portfolio performance with realistic transaction costs.
 
-Strategies:
-    Long-Only:   Buy equal-weight top K predicted stocks each period
-    Long-Short:  Long top K, short bottom K (dollar-neutral)
-    Buy-and-Hold: Equal-weight all stocks, never rebalance
+Strategies per model:
+    Long-Only:    Buy equal-weight top K predicted stocks each period
+    Long-Short:   Long top K, short bottom K (dollar-neutral)
 
-Models evaluated:
-    5-day: random_forest, ridge_regression, gru_default (best performers)
-    1-day: random_forest, ridge_regression, lstm_default
+Benchmarks:
+    Buy-and-Hold: Equal-weight all available stocks, rebalanced each period
 
-Output:
+Features:
+    - Auto-discovers ALL trained models from outputs/
+    - Transaction costs (0.1% per position round-trip)
+    - Drawdown control (halves position sizes at -15% drawdown)
+    - Full metrics: return, Sharpe, Calmar, max drawdown, win rate
+    - Statistical significance test on period returns
+    - Equity curves saved as CSV for charting
+    - Trade log saved per model
+
+Output structure:
     outputs/portfolio/
-        equity_curves_5d.csv      — daily portfolio values for all strategies
-        equity_curves_1d.csv
-        metrics_5d.csv            — full performance metrics per model
-        metrics_1d.csv
-        trades_5d.csv             — every trade with cost breakdown
-        trades_1d.csv
-        summary_report.md         — readable summary for paper
+        equity_curves_1d.csv       — portfolio value per period per model
+        equity_curves_5d.csv
+        metrics_1d.csv             — all performance metrics
+        metrics_5d.csv
+        trades_1d.csv              — every rebalancing trade
+        trades_5d.csv
+        summary_report.md          — paper-ready markdown table
 
 Run:
     python src/models/portfolio_backtest.py
 """
 
+from __future__ import annotations
+
 from pathlib import Path
-import json
 import warnings
+import math
 
 import numpy as np
 import pandas as pd
@@ -37,386 +46,453 @@ from scipy.stats import ttest_1samp
 
 warnings.filterwarnings("ignore")
 
+
 # ── Paths ──────────────────────────────────────────────────────────────────────
 
-def find_base_dir() -> Path:
-    """Find the project root whether this file is run from root or src/models."""
-    file_path = Path(__file__).resolve()
-    for parent in [file_path.parent, *file_path.parents]:
-        if (parent / "outputs").exists() and (parent / "data").exists():
-            return parent
-    return file_path.parent
-
-
-BASE_DIR     = find_base_dir()
-OUTPUTS_DIR  = BASE_DIR / "outputs"
+BASE_DIR      = Path(__file__).resolve().parents[2]
+OUTPUTS_DIR   = BASE_DIR / "outputs"
 PORTFOLIO_DIR = OUTPUTS_DIR / "portfolio"
+
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
 INITIAL_CAPITAL       = 10_000.0
-TOP_K_LONGS           = 5
-BOTTOM_K_SHORTS       = 5
-COST_PER_TRADE        = 0.001   # 10 bps per $1 of portfolio turnover
-MAX_POSITION_WEIGHT   = 0.30    # no single stock > 30% of portfolio
-DRAWDOWN_THRESHOLD    = 0.15    # reduce sizes 50% if drawdown exceeds 15%
+TOP_K_LONGS           = 5        # buy top K predicted stocks
+BOTTOM_K_SHORTS       = 5        # short bottom K predicted stocks
+COST_PER_TRADE        = 0.001    # 0.1% per position round-trip
+DRAWDOWN_THRESHOLD    = 0.15     # reduce sizes by 50% if drawdown > 15%
 TRADING_DAYS_PER_YEAR = 252
 
-# Models to backtest per horizon
-MODELS_5D = ["random_forest", "ridge_regression", "gru_default"]
-MODELS_1D = ["random_forest", "ridge_regression", "lstm_default"]
 
-# ── Prediction file discovery ──────────────────────────────────────────────────
+# ── Model discovery ────────────────────────────────────────────────────────────
 
-def find_predictions(model_name: str, horizon: str) -> Path | None:
+def discover_models(horizon: str) -> dict[str, Path]:
     """
-    Find the test prediction CSV for a given model and horizon.
+    Auto-discover all prediction files for a given horizon.
+
     Searches outputs/ recursively for predictions_{horizon}_test.csv
-    inside a folder matching the model name.
+    and infers a clean model name from the directory structure.
+
+    Returns dict of {model_name: path}.
     """
     pattern = f"predictions_{horizon}_test.csv"
+    found   = {}
 
-    for path in OUTPUTS_DIR.rglob(pattern):
-        if "reports" in str(path):
+    for path in sorted(OUTPUTS_DIR.rglob(pattern)):
+        # Skip report artifacts
+        if "reports" in str(path) or "portfolio" in str(path):
             continue
-        parts = list(path.relative_to(OUTPUTS_DIR).parts)
 
-        # baselines/random_forest/predictions_5d_test.csv
-        if len(parts) >= 2 and parts[0] == "baselines" and parts[1] == model_name:
-            return path
+        # Build model name from relative path
+        try:
+            parts = list(path.relative_to(OUTPUTS_DIR).parts)
+        except ValueError:
+            continue
 
-        # lstm/default/predictions_5d_test.csv  → model name = lstm_default
-        if len(parts) >= 3:
-            folder_name = f"{parts[0]}_{parts[1]}"
-            if folder_name == model_name:
-                return path
+        # outputs/baselines/random_forest/predictions_1d_test.csv → random_forest
+        if len(parts) >= 3 and parts[0] == "baselines":
+            model_name = parts[1]
 
-        # direct match on parent folder name
-        if path.parent.name == model_name:
-            return path
+        # outputs/lstm/default/predictions_1d_test.csv → lstm_default
+        # outputs/gru/tuned/predictions_1d_test.csv    → gru_tuned
+        elif len(parts) >= 3:
+            model_name = f"{parts[0]}_{parts[1]}"
 
-    return None
+        else:
+            model_name = path.parent.name
+
+        found[model_name] = path
+
+    return found
 
 
-def load_predictions(model_name: str, horizon: str) -> pd.DataFrame | None:
-    """Load and validate a prediction CSV."""
-    path = find_predictions(model_name, horizon)
-    if path is None:
-        print(f"  [SKIP] {model_name} ({horizon}) — prediction file not found")
+def load_predictions(model_name: str, path: Path) -> pd.DataFrame | None:
+    """
+    Load and validate a prediction CSV.
+
+    Expected columns: Date, ticker, y_true, y_pred
+    y_true = actual return for that period (next-day or 5-day log return)
+    y_pred = model's predicted return
+    """
+    try:
+        df = pd.read_csv(path)
+    except Exception as e:
+        print(f"  [SKIP] {model_name} — could not read {path}: {e}")
         return None
 
-    df = pd.read_csv(path)
     required = {"Date", "ticker", "y_true", "y_pred"}
     if not required.issubset(df.columns):
-        print(f"  [SKIP] {model_name} ({horizon}) — missing columns in {path}")
+        print(f"  [SKIP] {model_name} — missing columns: {required - set(df.columns)}")
         return None
 
     df["Date"] = pd.to_datetime(df["Date"])
     df = df.sort_values(["Date", "ticker"]).reset_index(drop=True)
-    print(f"  [OK]   {model_name} ({horizon}) — {len(df)} rows, "
-          f"{df['Date'].nunique()} dates, {df['ticker'].nunique()} tickers")
+
+    n_dates   = df["Date"].nunique()
+    n_tickers = df["ticker"].nunique()
+    print(f"  [OK]   {model_name:<25} {len(df):>6} rows  {n_dates:>4} dates  {n_tickers:>3} tickers")
+
     return df
 
 
-# ── Portfolio construction ─────────────────────────────────────────────────────
+# ── Portfolio simulation ───────────────────────────────────────────────────────
 
-def build_portfolio(
-    df: pd.DataFrame,
-    strategy: str,           # "long_only" or "long_short"
-    holding_days: int,
+def simulate_portfolio(
+    df:              pd.DataFrame,
+    strategy:        str,           # "long_only" | "long_short"
+    holding_days:    int,
     initial_capital: float,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Simulate a portfolio from predictions.
+    Simulate a trading strategy over the test period.
 
-    Rebalances every `holding_days` trading dates.
-    Applies transaction costs, position limits, and drawdown control.
+    On each rebalancing date:
+      1. Rank stocks by predicted return (y_pred)
+      2. Long the top K (long_only) or long top K / short bottom K (long_short)
+      3. Earn the actual return (y_true) for those stocks that period
+      4. Deduct transaction costs
+      5. Apply drawdown control if portfolio is down > 15% from peak
+
+    The y_true column already represents the correct forward return
+    (next-day for 1d, 5-day cumulative for 5d) so we use it directly
+    as the realized period return without any lookahead.
 
     Returns:
-        equity_df : one row per rebalancing date with portfolio value
-        trades_df : one row per trade (buy or sell)
+        equity_df : one row per rebalancing date
+        trades_df : one row per rebalancing date with trade details
     """
-    dates      = sorted(df["Date"].unique())
-    capital    = initial_capital
-    peak       = initial_capital
-    equity_rows = []
-    trade_rows  = []
-    current_weights: dict[str, float] = {}  # ticker -> portfolio weight
-
-    # Rebalance every holding_days dates
+    dates       = sorted(df["Date"].unique())
     rebal_dates = dates[::holding_days]
 
-    for i, rebal_date in enumerate(rebal_dates):
+    capital   = initial_capital
+    peak      = initial_capital
+    prev_longs  : set[str] = set()
+    prev_shorts : set[str] = set()
+
+    equity_rows = []
+    trade_rows  = []
+
+    for rebal_date in rebal_dates:
         day_df = df[df["Date"] == rebal_date].copy()
 
-        if len(day_df) < TOP_K_LONGS + (BOTTOM_K_SHORTS if strategy == "long_short" else 0):
-            # Not enough stocks — carry forward
+        min_stocks = TOP_K_LONGS + (BOTTOM_K_SHORTS if strategy == "long_short" else 0)
+        if len(day_df) < min_stocks:
+            # Not enough stocks available — hold cash
             equity_rows.append({
-                "Date":      rebal_date,
+                "Date":            rebal_date,
                 "portfolio_value": capital,
-                "strategy":  strategy,
+                "gross_return":    0.0,
+                "net_return":      0.0,
+                "cost":            0.0,
+                "drawdown":        (capital - peak) / peak,
+                "size_mult":       1.0,
+                "n_longs":         0,
+                "n_shorts":        0,
             })
             continue
 
-        day_df = day_df.sort_values("y_pred", ascending=False).reset_index(drop=True)
-        longs  = day_df.head(TOP_K_LONGS)["ticker"].tolist()
-
-        if strategy == "long_short":
-            shorts = day_df.tail(BOTTOM_K_SHORTS)["ticker"].tolist()
-        else:
-            shorts = []
+        # ── Stock selection ────────────────────────────────────────────────────
+        ranked  = day_df.sort_values("y_pred", ascending=False).reset_index(drop=True)
+        longs   = set(ranked.head(TOP_K_LONGS)["ticker"].tolist())
+        shorts  = set(ranked.tail(BOTTOM_K_SHORTS)["ticker"].tolist()) if strategy == "long_short" else set()
 
         # ── Drawdown control ───────────────────────────────────────────────────
-        drawdown  = (capital - peak) / peak if peak > 0 else 0
+        drawdown  = (capital - peak) / peak
         size_mult = 0.5 if drawdown < -DRAWDOWN_THRESHOLD else 1.0
 
-        # ── Target weights and transaction costs ───────────────────────────────
-        # Transaction cost is charged on traded notional, not on position count.
-        if strategy == "long_only":
-            target_weights = {ticker: size_mult / TOP_K_LONGS for ticker in longs}
-        else:
-            target_weights = {ticker: 0.5 * size_mult / TOP_K_LONGS for ticker in longs}
-            target_weights.update({
-                ticker: -0.5 * size_mult / BOTTOM_K_SHORTS for ticker in shorts
-            })
+        # ── Realized returns ───────────────────────────────────────────────────
+        # y_true is the actual log return for that stock that period
+        long_log_ret  = float(day_df[day_df["ticker"].isin(longs)]["y_true"].mean())
+        short_log_ret = float(day_df[day_df["ticker"].isin(shorts)]["y_true"].mean()) if shorts else 0.0
 
-        turnover = sum(
-            abs(target_weights.get(ticker, 0.0) - current_weights.get(ticker, 0.0))
-            for ticker in set(target_weights) | set(current_weights)
-        )
-        cost_rate = COST_PER_TRADE * turnover
-
-        # ── Apply realized return ──────────────────────────────────────────────
-        simple_returns = {
-            row.ticker: float(np.exp(row.y_true) - 1)
-            for row in day_df.itertuples(index=False)
-        }
-        gross_return = float(
-            sum(weight * simple_returns.get(ticker, 0.0)
-                for ticker, weight in target_weights.items())
-        )
+        # Convert log returns to simple returns for compounding
+        long_simple  = float(np.exp(long_log_ret)  - 1)
+        short_simple = float(np.exp(short_log_ret) - 1)
 
         if strategy == "long_only":
-            long_returns = float(np.mean([simple_returns[ticker] for ticker in longs]))
-            short_returns = None
+            # All capital in long positions
+            gross_return = long_simple
         else:
-            long_returns = float(np.mean([simple_returns[ticker] for ticker in longs]))
-            short_returns = float(np.mean([simple_returns[ticker] for ticker in shorts]))
+            # Dollar-neutral: half capital long, half short
+            # Profit when longs go up AND shorts go down
+            gross_return = (long_simple - short_simple) / 2.0
 
-        net_return = gross_return - cost_rate
-        capital    = capital * (1 + net_return)
+        gross_return *= size_mult
+
+        # ── Transaction costs ──────────────────────────────────────────────────
+        # Cost = 0.1% per position that changes (new opens + closed positions)
+        new_longs   = longs  - prev_longs
+        new_shorts  = shorts - prev_shorts
+        closed      = (prev_longs | prev_shorts) - (longs | shorts)
+        n_trades    = len(new_longs) + len(new_shorts) + len(closed)
+        cost        = COST_PER_TRADE * n_trades  # as fraction of capital
+
+        # ── Net return and capital update ──────────────────────────────────────
+        net_return = gross_return - cost
+        capital    = capital * (1.0 + net_return)
         peak       = max(peak, capital)
 
-        current_weights = target_weights
+        # Update position tracking
+        prev_longs  = longs
+        prev_shorts = shorts
 
         equity_rows.append({
             "Date":            rebal_date,
             "portfolio_value": capital,
-            "strategy":        strategy,
-            "long_return":     long_returns,
-            "short_return":    short_returns if shorts else None,
             "gross_return":    gross_return,
             "net_return":      net_return,
-            "cost":            cost_rate,
-            "turnover":        turnover,
+            "cost":            cost,
             "drawdown":        drawdown,
             "size_mult":       size_mult,
+            "n_longs":         len(longs),
+            "n_shorts":        len(shorts),
         })
 
         trade_rows.append({
             "Date":          rebal_date,
-            "longs":         ",".join(longs),
-            "shorts":        ",".join(shorts),
-            "turnover":      turnover,
-            "cost_rate":     cost_rate,
+            "longs":         ",".join(sorted(longs)),
+            "shorts":        ",".join(sorted(shorts)),
+            "n_new_longs":   len(new_longs),
+            "n_new_shorts":  len(new_shorts),
+            "n_closed":      len(closed),
+            "n_trades":      n_trades,
+            "cost":          cost,
             "gross_return":  gross_return,
             "net_return":    net_return,
             "capital_after": capital,
         })
 
-    equity_df = pd.DataFrame(equity_rows)
-    trades_df = pd.DataFrame(trade_rows)
-    return equity_df, trades_df
+    return pd.DataFrame(equity_rows), pd.DataFrame(trade_rows)
 
 
-def build_buy_hold(df: pd.DataFrame, holding_days: int, initial_capital: float) -> pd.DataFrame:
+def simulate_buy_and_hold(
+    df:              pd.DataFrame,
+    holding_days:    int,
+    initial_capital: float,
+) -> pd.DataFrame:
     """
-    Equal-weight buy-and-hold baseline.
-    Buys all stocks on day 1, holds until end.
-    Portfolio value tracks average cumulative return.
+    Equal-weight buy-and-hold benchmark.
+    Invests in all available stocks equally each rebalancing period.
+    No transaction costs (long-term passive strategy).
     """
-    dates = sorted(df["Date"].unique())
+    dates       = sorted(df["Date"].unique())
     rebal_dates = dates[::holding_days]
 
-    # Compute cumulative log returns per date
-    rows = []
-    capital = initial_capital
+    capital     = initial_capital
+    peak        = initial_capital
+    equity_rows = []
 
     for rebal_date in rebal_dates:
         day_df = df[df["Date"] == rebal_date]
-        avg_return = float(day_df["y_true"].mean()) if len(day_df) > 0 else 0.0
-        period_return = float(np.exp(avg_return) - 1)
-        capital = capital * (1 + period_return)
-        rows.append({
+        if day_df.empty:
+            continue
+
+        avg_log_ret  = float(day_df["y_true"].mean())
+        period_ret   = float(np.exp(avg_log_ret) - 1)
+        capital      = capital * (1.0 + period_ret)
+        peak         = max(peak, capital)
+        drawdown     = (capital - peak) / peak
+
+        equity_rows.append({
             "Date":            rebal_date,
             "portfolio_value": capital,
-            "strategy":        "buy_and_hold",
-            "gross_return":    period_return,
-            "net_return":      period_return,
+            "gross_return":    period_ret,
+            "net_return":      period_ret,
             "cost":            0.0,
-            "turnover":        0.0,
+            "drawdown":        drawdown,
         })
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(equity_rows)
 
 
-# ── Metrics ────────────────────────────────────────────────────────────────────
+# ── Performance metrics ────────────────────────────────────────────────────────
 
-def compute_portfolio_metrics(
-    equity_df: pd.DataFrame,
-    initial_capital: float,
-    holding_days: int = 1,
-) -> dict:
-    """Compute comprehensive portfolio metrics from equity curve."""
-    if equity_df.empty or "portfolio_value" not in equity_df.columns:
+def compute_metrics(equity_df: pd.DataFrame, initial_capital: float) -> dict:
+    """
+    Compute comprehensive portfolio performance metrics.
+
+    Metrics:
+        final_value        — ending portfolio value in dollars
+        total_return       — (final - initial) / initial
+        annualized_return  — geometric annualized return
+        sharpe_ratio       — annualized Sharpe (risk-free rate = 0)
+        sortino_ratio      — Sharpe using only downside volatility
+        max_drawdown       — worst peak-to-trough decline
+        calmar_ratio       — annualized return / |max drawdown|
+        win_rate           — fraction of periods with positive net return
+        avg_win            — average positive period return
+        avg_loss           — average negative period return
+        profit_factor      — total gains / total losses
+        total_costs        — cumulative transaction costs paid
+        n_periods          — number of rebalancing periods
+        p_value            — t-test p-value (H0: mean period return = 0)
+        significant        — True if p < 0.05
+    """
+    if equity_df.empty:
         return {}
 
-    values = equity_df["portfolio_value"].values
-    if "net_return" in equity_df.columns:
-        returns = equity_df["net_return"].dropna().to_numpy(dtype=float)
-    else:
-        returns = np.diff(values) / values[:-1]
+    values = equity_df["portfolio_value"].values.astype(float)
 
-    final_value    = float(values[-1])
-    total_return   = float(final_value / initial_capital - 1)
-    n_periods      = len(returns)
-    periods_per_yr = TRADING_DAYS_PER_YEAR / max(1, holding_days)
+    if len(values) < 2:
+        return {"final_value": float(values[-1]), "total_return": float(values[-1] / initial_capital - 1)}
 
-    # Annualized return
-    if n_periods > 0 and values[0] > 0:
-        years = n_periods / periods_per_yr
-        ann_return = float((final_value / initial_capital) ** (1 / years) - 1)
+    # Period returns (net)
+    period_rets = equity_df["net_return"].values.astype(float) if "net_return" in equity_df.columns \
+                  else np.diff(values) / values[:-1]
+
+    final_value  = float(values[-1])
+    total_return = float(final_value / initial_capital - 1)
+    n_periods    = len(period_rets)
+
+    # Annualized return — geometric
+    if n_periods > 0 and initial_capital > 0:
+        ann_return = float((final_value / initial_capital) ** (TRADING_DAYS_PER_YEAR / n_periods) - 1)
     else:
         ann_return = total_return
 
-    # Sharpe ratio
-    return_std = returns.std(ddof=1) if len(returns) > 1 else 0
-    if len(returns) > 1 and return_std > 0:
-        sharpe = float(returns.mean() / return_std * np.sqrt(periods_per_yr))
+    # Sharpe ratio — annualized
+    if period_rets.std() > 0:
+        sharpe = float(period_rets.mean() / period_rets.std() * math.sqrt(TRADING_DAYS_PER_YEAR / n_periods))
     else:
         sharpe = 0.0
 
+    # Sortino ratio — uses only downside deviation
+    downside = period_rets[period_rets < 0]
+    if len(downside) > 0 and downside.std() > 0:
+        sortino = float(period_rets.mean() / downside.std() * math.sqrt(TRADING_DAYS_PER_YEAR / n_periods))
+    else:
+        sortino = float("nan")
+
     # Max drawdown
-    curve_values = np.concatenate(([initial_capital], values))
-    peak    = np.maximum.accumulate(curve_values)
-    dd      = (curve_values - peak) / peak
+    peak    = np.maximum.accumulate(values)
+    dd      = (values - peak) / peak
     max_dd  = float(dd.min())
 
     # Calmar ratio
-    calmar = float(ann_return / abs(max_dd)) if max_dd < 0 else float("nan")
+    calmar = float(ann_return / abs(max_dd)) if max_dd < -1e-6 else float("nan")
 
-    # Win rate (% of periods with positive return)
-    win_rate = float((returns > 0).mean()) if len(returns) > 0 else 0.0
+    # Win/loss statistics
+    wins   = period_rets[period_rets > 0]
+    losses = period_rets[period_rets < 0]
+    win_rate     = float((period_rets > 0).mean())
+    avg_win      = float(wins.mean())   if len(wins) > 0   else 0.0
+    avg_loss     = float(losses.mean()) if len(losses) > 0 else 0.0
+    profit_factor = float(wins.sum() / abs(losses.sum())) if losses.sum() < 0 else float("nan")
 
-    # Significance test
-    if len(returns) > 10:
-        _, p_value = ttest_1samp(returns, 0)
+    # Total costs
+    total_costs = float(equity_df["cost"].sum()) if "cost" in equity_df.columns else 0.0
+
+    # Statistical significance
+    if n_periods >= 10:
+        _, p_value = ttest_1samp(period_rets, 0)
+        significant = bool(p_value < 0.05)
     else:
-        p_value = float("nan")
-
-    total_costs   = float(equity_df["cost"].sum()) if "cost" in equity_df.columns else 0.0
+        p_value     = float("nan")
+        significant = False
 
     return {
-        "final_value":      final_value,
-        "total_return":     total_return,
-        "annualized_return": ann_return,
-        "sharpe_ratio":     sharpe,
-        "max_drawdown":     max_dd,
-        "calmar_ratio":     calmar,
-        "win_rate":         win_rate,
-        "n_periods":        n_periods,
-        "total_costs":      total_costs,
-        "p_value":          p_value,
-        "significant":      p_value < 0.05 if not pd.isna(p_value) else False,
+        "final_value":        final_value,
+        "total_return":       total_return,
+        "annualized_return":  ann_return,
+        "sharpe_ratio":       sharpe,
+        "sortino_ratio":      sortino,
+        "max_drawdown":       max_dd,
+        "calmar_ratio":       calmar,
+        "win_rate":           win_rate,
+        "avg_win":            avg_win,
+        "avg_loss":           avg_loss,
+        "profit_factor":      profit_factor,
+        "total_costs":        total_costs,
+        "n_periods":          n_periods,
+        "p_value":            p_value,
+        "significant":        significant,
     }
 
 
 # ── Reporting ──────────────────────────────────────────────────────────────────
 
-def print_metrics(model_name: str, strategy: str, horizon: str, m: dict, bh: dict) -> None:
-    ret    = m.get("total_return", 0)
-    sharpe = m.get("sharpe_ratio", 0)
-    dd     = m.get("max_drawdown", 0)
-    calmar = m.get("calmar_ratio", float("nan"))
-    win    = m.get("win_rate", 0)
-    cost   = m.get("total_costs", 0)
-    sig    = "✓" if m.get("significant") else "✗"
-    excess = ret - bh.get("total_return", 0)
+def print_metrics(model_name: str, strategy: str, m: dict, bh: dict) -> None:
+    ret   = m.get("total_return", 0)
+    ann   = m.get("annualized_return", 0)
+    sh    = m.get("sharpe_ratio", 0)
+    so    = m.get("sortino_ratio", float("nan"))
+    dd    = m.get("max_drawdown", 0)
+    cal   = m.get("calmar_ratio", float("nan"))
+    win   = m.get("win_rate", 0)
+    cost  = m.get("total_costs", 0)
+    pf    = m.get("profit_factor", float("nan"))
+    exc   = ret - bh.get("total_return", 0)
+    sig   = "✓" if m.get("significant") else "✗"
+    pval  = m.get("p_value", float("nan"))
 
-    print(f"    Return:     {ret:+.1%}  (excess vs B&H: {excess:+.1%})")
-    print(f"    Sharpe:     {sharpe:.3f}")
-    print(f"    Max DD:     {dd:.1%}")
-    print(f"    Calmar:     {calmar:.2f}" if not pd.isna(calmar) else "    Calmar:     —")
-    print(f"    Win rate:   {win:.1%}")
-    print(f"    Total cost: {cost:.4f}")
-    print(f"    Significant:{sig} (p={m.get('p_value', float('nan')):.4f})")
+    so_s  = f"{so:.3f}" if not (isinstance(so, float) and math.isnan(so)) else "—"
+    cal_s = f"{cal:.3f}" if not (isinstance(cal, float) and math.isnan(cal)) else "—"
+    pf_s  = f"{pf:.3f}" if not (isinstance(pf, float) and math.isnan(pf)) else "—"
+    pv_s  = f"{pval:.4f}" if not (isinstance(pval, float) and math.isnan(pval)) else "—"
+
+    print(f"    Return:         {ret:+.2%}  (annualized: {ann:+.2%})")
+    print(f"    vs Buy-Hold:    {exc:+.2%}")
+    print(f"    Sharpe:         {sh:.3f}    Sortino: {so_s}")
+    print(f"    Max Drawdown:   {dd:.2%}   Calmar: {cal_s}")
+    print(f"    Win Rate:       {win:.1%}    Profit Factor: {pf_s}")
+    print(f"    Total Costs:    {cost:.4f}")
+    print(f"    Significance:   {sig} (p={pv_s})")
 
 
-def build_summary_report(all_results: list[dict]) -> str:
-    """Build a Markdown summary report for the paper."""
+def build_markdown_report(all_results: list[dict]) -> str:
     lines = [
-        "# Portfolio Backtest Results",
+        "# Portfolio Backtest — Summary Report",
         "",
         f"Initial capital: ${INITIAL_CAPITAL:,.0f}",
-        f"Transaction cost: {COST_PER_TRADE:.1%} per $1 of portfolio turnover",
-        f"Long positions: top {TOP_K_LONGS} stocks",
+        f"Transaction cost: {COST_PER_TRADE:.1%} per position per rebalance (round-trip)",
+        f"Long positions: top {TOP_K_LONGS} stocks by predicted return",
         f"Short positions: bottom {BOTTOM_K_SHORTS} stocks (long-short only)",
-        f"Drawdown control: reduce size by 50% if drawdown exceeds {DRAWDOWN_THRESHOLD:.0%}",
+        f"Drawdown control: reduce size 50% when portfolio drawdown > {DRAWDOWN_THRESHOLD:.0%}",
         "",
     ]
 
-    for horizon in ["5d", "1d"]:
-        label = "5-Day" if horizon == "5d" else "1-Day"
-        lines.append(f"## {label} Horizon")
-        lines.append("")
-        lines.append("| Model | Strategy | Return | Sharpe | Max DD | Calmar | vs B&H | Win% | Sig |")
-        lines.append("|---|---|---|---|---|---|---|---|---|")
+    for horizon in ["1d", "5d"]:
+        label = "1-Day" if horizon == "1d" else "5-Day"
+        lines.append(f"## {label} Horizon\n")
 
-        horizon_results = [r for r in all_results if r["horizon"] == horizon]
-        bh_return = next(
-            (r["metrics"]["total_return"] for r in horizon_results
-             if r["model"] == "buy_and_hold"), 0.0
-        )
+        hr = [r for r in all_results if r["horizon"] == horizon]
+        bh_ret = next((r["metrics"]["total_return"] for r in hr if r["model"] == "buy_and_hold"), 0.0)
+        hr_sorted = sorted(hr, key=lambda x: x["metrics"].get("total_return", -999), reverse=True)
 
-        for r in sorted(horizon_results, key=lambda x: x["metrics"].get("total_return", 0), reverse=True):
+        lines.append("| Model | Strategy | Return | Ann. Ret | Sharpe | MaxDD | Calmar | Win% | vs B&H | Sig |")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|")
+
+        for r in hr_sorted:
             m   = r["metrics"]
             ret = m.get("total_return", 0)
+            ann = m.get("annualized_return", 0)
             sh  = m.get("sharpe_ratio", 0)
             dd  = m.get("max_drawdown", 0)
             cal = m.get("calmar_ratio", float("nan"))
             win = m.get("win_rate", 0)
-            exc = ret - bh_return if r["model"] != "buy_and_hold" else 0
+            exc = ret - bh_ret if r["model"] != "buy_and_hold" else 0.0
             sig = "✓" if m.get("significant") else "—"
-            cal_s = f"{cal:.2f}" if not pd.isna(cal) else "—"
+            cal_s = f"{cal:.2f}" if not (isinstance(cal, float) and math.isnan(cal)) else "—"
 
             lines.append(
-                f"| {r['model']} | {r['strategy']} | {ret:+.1%} | {sh:.3f} | "
-                f"{dd:.1%} | {cal_s} | {exc:+.1%} | {win:.1%} | {sig} |"
+                f"| {r['model']} | {r['strategy']} "
+                f"| {ret:+.1%} | {ann:+.1%} | {sh:.3f} | {dd:.1%} "
+                f"| {cal_s} | {win:.0%} | {exc:+.1%} | {sig} |"
             )
 
         lines.append("")
 
-    lines.extend([
+    lines += [
         "## Notes",
         "",
-        "- Returns compound over each holding period",
-        "- Transaction costs are charged on portfolio turnover, not position count",
-        "- Drawdown control activates at -15% portfolio drawdown",
-        "- Significance test: one-sample t-test on period returns (H0: mean=0)",
-        "- Buy-and-hold: equal-weight all stocks, rebalanced each period",
-        "- 2024 was a strong bull market — results may not generalize to bear markets",
+        "- Returns compound over each holding period (1-day or 5-day)",
+        "- Transaction costs applied per position changed per rebalance",
+        "- Buy-and-hold: equal-weight all stocks, no transaction costs",
+        "- Significance: one-sample t-test on period returns (H0: mean = 0)",
+        "- Drawdown control activates when portfolio drops > 15% from peak",
+        "- Results based on out-of-sample test set only",
         "",
-    ])
+    ]
 
     return "\n".join(lines)
 
@@ -426,74 +502,81 @@ def build_summary_report(all_results: list[dict]) -> str:
 def main() -> None:
     PORTFOLIO_DIR.mkdir(parents=True, exist_ok=True)
 
-    all_results       = []
-    all_equity_rows   = []
-    all_trades_rows   = []
-    all_metrics_rows  = []
+    all_results      : list[dict]            = []
+    all_equity_rows  : list[pd.DataFrame]    = []
+    all_trades_rows  : list[pd.DataFrame]    = []
+    all_metrics_rows : list[dict]            = []
 
-    config = {
-        "1d": {"models": MODELS_1D, "holding_days": 1},
-        "5d": {"models": MODELS_5D, "holding_days": 5},
+    horizons = {
+        "1d": {"holding_days": 1,  "label": "1-Day"},
+        "5d": {"holding_days": 5,  "label": "5-Day"},
     }
 
-    for horizon, cfg in config.items():
+    for horizon, cfg in horizons.items():
         holding = cfg["holding_days"]
-        label   = "5-Day" if horizon == "5d" else "1-Day"
-        print(f"\n{'='*60}")
-        print(f"  {label} Horizon  (holding period = {holding} day(s))")
-        print(f"{'='*60}")
+        label   = cfg["label"]
 
-        # ── Buy-and-hold baseline (use first available model's predictions) ───
-        bh_metrics = {}
-        for model_name in cfg["models"]:
-            df = load_predictions(model_name, horizon)
+        print(f"\n{'='*65}")
+        print(f"  {label} Horizon  (holding period = {holding} trading day(s))")
+        print(f"{'='*65}")
+
+        # ── Discover all prediction files ──────────────────────────────────────
+        model_paths = discover_models(horizon)
+        if not model_paths:
+            print(f"  [WARN] No prediction files found for horizon {horizon}")
+            continue
+
+        print(f"\n  Found {len(model_paths)} models:")
+        loaded: dict[str, pd.DataFrame] = {}
+        for model_name, path in sorted(model_paths.items()):
+            df = load_predictions(model_name, path)
             if df is not None:
-                bh_equity  = build_buy_hold(df, holding, INITIAL_CAPITAL)
-                bh_metrics = compute_portfolio_metrics(
-                    bh_equity, INITIAL_CAPITAL, holding
-                )
+                loaded[model_name] = df
 
-                bh_equity["model"]   = "buy_and_hold"
-                bh_equity["horizon"] = horizon
-                all_equity_rows.append(bh_equity)
+        if not loaded:
+            print("  [WARN] No predictions could be loaded")
+            continue
 
-                all_results.append({
-                    "model":    "buy_and_hold",
-                    "strategy": "buy_and_hold",
-                    "horizon":  horizon,
-                    "metrics":  bh_metrics,
-                })
-                break
+        # ── Buy-and-Hold benchmark ─────────────────────────────────────────────
+        ref_df   = next(iter(loaded.values()))
+        bh_eq    = simulate_buy_and_hold(ref_df, holding, INITIAL_CAPITAL)
+        bh_m     = compute_metrics(bh_eq, INITIAL_CAPITAL)
 
-        print(f"\n  Buy-and-Hold: {bh_metrics.get('total_return', 0):+.1%}")
+        bh_eq["model"]    = "buy_and_hold"
+        bh_eq["strategy"] = "buy_and_hold"
+        bh_eq["horizon"]  = horizon
+        all_equity_rows.append(bh_eq)
+        all_results.append({"model": "buy_and_hold", "strategy": "buy_and_hold",
+                             "horizon": horizon, "metrics": bh_m})
 
-        # ── Each model ─────────────────────────────────────────────────────────
-        for model_name in cfg["models"]:
-            print(f"\n  Model: {model_name}")
-            df = load_predictions(model_name, horizon)
-            if df is None:
+        print(f"\n  Buy-and-Hold: {bh_m.get('total_return', 0):+.2%}  "
+              f"Sharpe: {bh_m.get('sharpe_ratio', 0):.3f}")
+
+        # ── Each model and strategy ────────────────────────────────────────────
+        for model_name, df in sorted(loaded.items()):
+            if model_name == "buy_and_hold":
                 continue
 
-            for strategy in ["long_only", "long_short"]:
-                print(f"\n    Strategy: {strategy}")
-                equity_df, trades_df = build_portfolio(
-                    df, strategy, holding, INITIAL_CAPITAL
+            print(f"\n  ── {model_name} ──")
+
+            for strategy in ("long_only", "long_short"):
+                print(f"\n    [{strategy}]")
+
+                equity_df, trades_df = simulate_portfolio(
+                    df, strategy, holding, INITIAL_CAPITAL,
                 )
 
                 if equity_df.empty:
-                    print("    [SKIP] No equity data produced")
+                    print("    [SKIP] No equity data")
                     continue
 
-                metrics = compute_portfolio_metrics(
-                    equity_df, INITIAL_CAPITAL, holding
-                )
-                print_metrics(model_name, strategy, horizon, metrics, bh_metrics)
+                m = compute_metrics(equity_df, INITIAL_CAPITAL)
+                print_metrics(model_name, strategy, m, bh_m)
 
-                # Tag for saving
+                # Tag dataframes
                 equity_df["model"]    = model_name
                 equity_df["strategy"] = strategy
                 equity_df["horizon"]  = horizon
-
                 trades_df["model"]    = model_name
                 trades_df["strategy"] = strategy
                 trades_df["horizon"]  = horizon
@@ -505,84 +588,71 @@ def main() -> None:
                     "model":    model_name,
                     "strategy": strategy,
                     "horizon":  horizon,
-                    "metrics":  metrics,
+                    "metrics":  m,
                 })
 
-                all_metrics_rows.append({
-                    "horizon":          horizon,
-                    "model":            model_name,
-                    "strategy":         strategy,
-                    "final_value":      metrics.get("final_value"),
-                    "total_return":     metrics.get("total_return"),
-                    "annualized_return": metrics.get("annualized_return"),
-                    "sharpe_ratio":     metrics.get("sharpe_ratio"),
-                    "max_drawdown":     metrics.get("max_drawdown"),
-                    "calmar_ratio":     metrics.get("calmar_ratio"),
-                    "win_rate":         metrics.get("win_rate"),
-                    "total_costs":      metrics.get("total_costs"),
-                    "n_periods":        metrics.get("n_periods"),
-                    "p_value":          metrics.get("p_value"),
-                    "significant":      metrics.get("significant"),
-                    "excess_vs_bh":     metrics.get("total_return", 0) - bh_metrics.get("total_return", 0),
-                })
+                row = {"horizon": horizon, "model": model_name, "strategy": strategy}
+                row.update(m)
+                row["excess_vs_bh"] = m.get("total_return", 0) - bh_m.get("total_return", 0)
+                all_metrics_rows.append(row)
 
     # ── Save outputs ───────────────────────────────────────────────────────────
 
     if all_equity_rows:
         equity_all = pd.concat(all_equity_rows, ignore_index=True)
-        for h in ["1d", "5d"]:
+        for h in ("1d", "5d"):
             sub = equity_all[equity_all["horizon"] == h]
             if not sub.empty:
                 sub.to_csv(PORTFOLIO_DIR / f"equity_curves_{h}.csv", index=False)
 
     if all_trades_rows:
         trades_all = pd.concat(all_trades_rows, ignore_index=True)
-        for h in ["1d", "5d"]:
+        for h in ("1d", "5d"):
             sub = trades_all[trades_all["horizon"] == h]
             if not sub.empty:
                 sub.to_csv(PORTFOLIO_DIR / f"trades_{h}.csv", index=False)
 
     if all_metrics_rows:
-        metrics_df = pd.DataFrame(all_metrics_rows)
-        for h in ["1d", "5d"]:
-            sub = metrics_df[metrics_df["horizon"] == h].sort_values(
-                "total_return", ascending=False
-            )
+        mdf = pd.DataFrame(all_metrics_rows)
+        for h in ("1d", "5d"):
+            sub = mdf[mdf["horizon"] == h].sort_values("total_return", ascending=False)
             if not sub.empty:
                 sub.to_csv(PORTFOLIO_DIR / f"metrics_{h}.csv", index=False)
 
-    # ── Markdown summary ───────────────────────────────────────────────────────
-
-    report = build_summary_report(all_results)
     report_path = PORTFOLIO_DIR / "summary_report.md"
-    report_path.write_text(report, encoding="utf-8")
+    report_path.write_text(build_markdown_report(all_results), encoding="utf-8")
 
-    # ── Final print ────────────────────────────────────────────────────────────
+    # ── Final summary ──────────────────────────────────────────────────────────
 
-    print(f"\n{'='*60}")
-    print("  PORTFOLIO BACKTEST COMPLETE")
-    print(f"{'='*60}")
+    print(f"\n{'='*65}")
+    print("  BACKTEST COMPLETE")
+    print(f"{'='*65}")
 
     if all_metrics_rows:
         mdf = pd.DataFrame(all_metrics_rows)
-        for h in ["1d", "5d"]:
+        for h in ("1d", "5d"):
             sub = mdf[mdf["horizon"] == h].sort_values("total_return", ascending=False)
-            if sub.empty: continue
-            lbl = "5-Day" if h == "5d" else "1-Day"
-            print(f"\n  {lbl} — Top Results (after transaction costs):")
-            print(f"  {'Model':<22} {'Strategy':<12} {'Return':>10} {'Sharpe':>8} {'MaxDD':>8} {'vs B&H':>10}")
-            print(f"  {'─'*22} {'─'*12} {'─'*10} {'─'*8} {'─'*8} {'─'*10}")
-            for _, r in sub.head(8).iterrows():
+            if sub.empty:
+                continue
+            lbl = "1-Day" if h == "1d" else "5-Day"
+            print(f"\n  {lbl} — All Results (sorted by return, after transaction costs):")
+            print(f"  {'Model':<28} {'Strategy':<12} {'Return':>9} {'Ann.':>8} "
+                  f"{'Sharpe':>7} {'MaxDD':>8} {'vs B&H':>9}")
+            print(f"  {'─'*28} {'─'*12} {'─'*9} {'─'*8} {'─'*7} {'─'*8} {'─'*9}")
+            for _, r in sub.iterrows():
+                ann = r.get("annualized_return", float("nan"))
+                ann_s = f"{ann:>+7.1%}" if not (isinstance(ann, float) and math.isnan(ann)) else "      —"
                 print(
-                    f"  {r['model']:<22} {r['strategy']:<12} "
-                    f"{r['total_return']:>+9.1%} {r['sharpe_ratio']:>8.3f} "
-                    f"{r['max_drawdown']:>7.1%} {r['excess_vs_bh']:>+9.1%}"
+                    f"  {r['model']:<28} {r['strategy']:<12} "
+                    f"{r['total_return']:>+8.1%} {ann_s} "
+                    f"{r['sharpe_ratio']:>7.3f} {r['max_drawdown']:>7.1%} "
+                    f"{r['excess_vs_bh']:>+8.1%}"
                 )
 
-    print(f"\n  Saved to: {PORTFOLIO_DIR}")
-    print(f"  Files:")
+    print(f"\n  Output: {PORTFOLIO_DIR}")
     for f in sorted(PORTFOLIO_DIR.iterdir()):
-        print(f"    {f.name}")
+        size = f.stat().st_size
+        print(f"    {f.name:<35} {size:>8,} bytes")
 
 
 if __name__ == "__main__":

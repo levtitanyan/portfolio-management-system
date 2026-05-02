@@ -127,3 +127,6 @@ python src/models/7_train_tcn.py
 python src/models/99_gather_report.py
 python portfolio_backtest.py
 ```
+
+-- i need to delete/edit Tuning, documents
+-- rename 99... and 100... 

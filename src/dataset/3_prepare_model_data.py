@@ -27,8 +27,13 @@ TEST_PATH  = SPLITS_DIR / "test.csv"
 
 # ── Split boundaries ───────────────────────────────────────────────────────────
 
+# old params
 TRAIN_END_DATE = "2021-12-31"
 VAL_END_DATE   = "2023-12-31"
+
+# new params
+# TRAIN_END_DATE = "2021-12-31"
+# VAL_END_DATE   = "2025-12-31"
 
 # ── Column definitions ─────────────────────────────────────────────────────────
 
