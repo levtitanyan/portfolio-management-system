@@ -1,183 +1,127 @@
-# Feature Plan
-
-This document describes the input features and prediction targets used in the stock return prediction model.
+# Feature Engineering Plan
 
 ## Goal
 
-Use **today's stock, market, and calendar information** to predict **next-day and 5-day forward stock returns**.
+Use today's stock-level, market-level, sector-level, and calendar information to predict forward stock log returns at four horizons: 1 day, 5 days, 10 days, and 30 days.
 
 ---
 
-## Targets
+## Prediction Targets (4)
 
-### target_next_day_return (primary)
-- **What:** tomorrow's stock log return
-- **Calculation:** `shift(log_return, -1)`
-- **Why:** primary prediction target — the model learns today's features to predict tomorrow's move
+All targets are cumulative log returns, computed as a rolling sum of daily log returns shifted into the future. A log return target at horizon H is equivalent to `log(price[t+H] / price[t])`.
 
-### target_5d_return (secondary)
-- **What:** cumulative 5-day forward log return
-- **Calculation:** `shift(rolling_sum(log_return, 5), -5)`
-- **Why:** medium-term target — daily noise averages out, directional signal is stronger
+| Target column | Formula | Horizon |
+|---|---|---|
+| `target_next_day_return` | `log_return.shift(-1)` | 1 trading day |
+| `target_5d_return` | `log_return.rolling(5).sum().shift(-5)` | 5 trading days |
+| `target_10d_return` | `log_return.rolling(10).sum().shift(-10)` | 10 trading days |
+| `target_30d_return` | `log_return.rolling(30).sum().shift(-30)` | 30 trading days |
+
+Because targets look into the future, the last H rows for each stock are dropped after target creation to prevent look-ahead bias.
 
 ---
 
-## Input Features (19 total)
+## Input Features (40 total)
 
-### Price Features (3)
+### Price Features (4)
 
-**1. log_return**
-- Daily stock return based on adjusted closing price
-- `ln(adj_close_t / adj_close_t-1)`
-- Main price movement signal; more stationary than raw price
-
-**2. return_5d**
-- Rolling 5-day cumulative log return
-- `sum(log_return) over past 5 days`
-- Captures weekly momentum trend
-
-**3. return_10d**
-- Rolling 10-day cumulative log return
-- `sum(log_return) over past 10 days`
-- Captures longer momentum — some patterns develop over two trading weeks
+| Feature | Formula | Description |
+|---|---|---|
+| `log_return` | `ln(adj_close_t / adj_close_{t-1})` | Daily log return — primary price signal |
+| `return_5d` | `log_return.rolling(5).sum()` | 5-day cumulative return — weekly momentum |
+| `return_10d` | `log_return.rolling(10).sum()` | 10-day cumulative return — two-week momentum |
+| `return_30d` | `log_return.rolling(30).sum()` | 30-day cumulative return — monthly momentum |
 
 ### Volume Features (3)
 
-**4. volume_change**
-- Day-to-day percentage change in trading volume, clipped at 1st/99th percentile
-- `(volume_t / volume_t-1) - 1`, clipped to remove extreme outliers
-- Shows whether trading activity became stronger or weaker
-
-**5. volume_ma_ratio**
-- Today's volume divided by 20-day average volume
-- `volume_t / rolling_mean(volume, 20)`
-- Detects unusually high or low trading activity relative to recent history
-
-**6. obv_change**
-- Daily percentage change in On-Balance Volume, clipped at 1st/99th percentile
-- OBV accumulates volume on up days and subtracts on down days
-- Tracks whether volume flow is confirming or diverging from price direction
+| Feature | Formula | Description |
+|---|---|---|
+| `volume_change` | `(volume_t / volume_{t-1}) - 1`, clipped [1%, 99%] | Day-over-day volume change |
+| `volume_ma_ratio` | `volume_t / rolling_mean(volume, 20)` | Volume relative to recent average |
+| `obv_change` | Daily pct change in On-Balance Volume, clipped [1%, 99%] | Whether volume flow confirms price direction |
 
 ### Momentum Features (5)
 
-**7. rsi_14**
-- 14-day Relative Strength Index
-- `100 - (100 / (1 + avg_gain / avg_loss))`
-- Detects overbought (>70) or oversold (<30) conditions
+| Feature | Formula | Description |
+|---|---|---|
+| `rsi_14` | Standard RSI over 14 days | Overbought (>70) / oversold (<30) signal |
+| `macd` | `EMA(12) - EMA(26)` | Short- vs long-term trend comparison |
+| `macd_signal` | `EMA(macd, 9)` | Smoothed MACD — momentum change signal |
+| `macd_diff` | `macd - macd_signal` | MACD histogram — turning point strength |
+| `rolling_sharpe_20` | `mean(log_return, 20) / std(log_return, 20)` | 20-day risk-adjusted momentum |
 
-**8. macd**
-- Moving Average Convergence Divergence
-- `EMA(12) - EMA(26)`
-- Compares short-term trend strength vs long-term trend
+### Volatility and Risk Features (8)
 
-**9. macd_signal**
-- 9-day EMA of MACD line
-- Smoothed version of MACD that helps identify momentum changes
+| Feature | Formula | Description |
+|---|---|---|
+| `volatility_10` | `std(log_return, 10)` | Recent 10-day price instability |
+| `volatility_20` | `std(log_return, 20)` | 20-day realized volatility |
+| `volatility_30` | `std(log_return, 30)` | 30-day realized volatility |
+| `atr_14` | 14-day Average True Range | Intraday price range volatility |
+| `bollinger_band_width` | `(upper - lower) / middle` (20-day bands) | Volatility expansion / contraction regime |
+| `beta_60` | `cov(stock, SPY) / var(SPY)` over 60 days | Systematic market sensitivity |
+| `idiosyncratic_vol_20` | `std(log_return - beta * spy_log_return, 20)` | Stock-specific risk unexplained by the market |
+| `volatility_regime_20` | `volatility_20 / rolling_mean(volatility_20, 60)` | Volatility relative to its own 60-day average |
 
-**10. macd_diff**
-- MACD minus its signal line (also called MACD histogram)
-- `macd - macd_signal`
-- Highlights turning points in momentum
+### Market Context Features (14)
 
-**11. rolling_sharpe_20**
-- 20-day rolling Sharpe ratio
-- `rolling_mean(log_return, 20) / rolling_std(log_return, 20)`
-- Risk-adjusted momentum — high value means consistent positive returns with low volatility
+| Feature | Description |
+|---|---|
+| `spy_log_return` | SPY daily log return — broad market direction |
+| `spy_return_5d` | SPY 5-day cumulative return |
+| `spy_return_10d` | SPY 10-day cumulative return |
+| `spy_return_30d` | SPY 30-day cumulative return |
+| `spy_volatility_20` | SPY 20-day realized volatility |
+| `qqq_log_return` | QQQ daily log return — Nasdaq / growth proxy |
+| `qqq_return_5d` | QQQ 5-day cumulative return |
+| `dia_log_return` | DIA daily log return — Dow Jones proxy |
+| `dia_return_5d` | DIA 5-day cumulative return |
+| `iwm_log_return` | IWM daily log return — small-cap proxy |
+| `iwm_return_5d` | IWM 5-day cumulative return |
+| `vix_close` | VIX closing level — market fear index |
+| `vix_log_return` | VIX daily log return — rising or falling fear |
+| `relative_strength` | `log_return - spy_log_return` — stock vs market outperformance |
 
-### Volatility Features (3)
+### Sector Features (5)
 
-**12. volatility_10**
-- 10-day rolling standard deviation of log returns
-- Measures recent price instability and risk
+Computed as leave-one-out: each stock's sector signal is the equal-weighted average of all other stocks in the same sector, so the target stock does not contaminate its own sector feature.
 
-**13. atr_14**
-- 14-day Average True Range
-- `rolling_mean(max(high-low, |high-prev_close|, |low-prev_close|), 14)`
-- Measures daily price range volatility — captures intraday risk that log returns miss
-
-**14. bollinger_band_width**
-- Width of 20-day Bollinger Bands relative to the moving average
-- `(upper_band - lower_band) / middle_band`
-- Captures volatility expansion and contraction regimes
-
-### Market Context Features (4)
-
-**15. spy_log_return**
-- Daily log return of SPY (S&P 500 ETF)
-- `ln(SPY_t / SPY_t-1)`
-- Market-wide direction proxy — tells the model whether the broad market moved up or down
-
-**16. vix_close**
-- Daily closing level of the VIX index (CBOE Volatility Index)
-- Known as the market's "fear index"
-- Higher values signal more expected uncertainty and market stress
-
-**17. vix_log_return**
-- Daily log return of VIX
-- `ln(VIX_t / VIX_t-1)`
-- Shows whether market fear is rising or falling
-
-**18. relative_strength**
-- Stock's log return minus SPY log return
-- `log_return - spy_log_return`
-- Captures whether the stock is outperforming or underperforming the market today
+| Feature | Description |
+|---|---|
+| `sector_log_return` | Sector average daily log return (excl. self) |
+| `sector_return_5d` | Sector average 5-day cumulative return |
+| `sector_return_10d` | Sector average 10-day cumulative return |
+| `sector_return_30d` | Sector average 30-day cumulative return |
+| `sector_relative_strength` | `log_return - sector_log_return` — stock vs sector |
 
 ### Calendar Features (1)
 
-**19. day_of_week**
-- Day of the trading week (0=Monday, 4=Friday)
-- Captures known weekday effects — e.g. the Monday effect (stocks tend to decline on Mondays) and the Friday effect
-
----
-
-## Data Sources
-
-| Source | Used for |
-|---|---|
-| Stock Adj Close | log_return, return_5d, return_10d, RSI, MACD, Bollinger, rolling_sharpe, volatility, target |
-| Stock OHLC | ATR (requires High, Low, Close) |
-| Stock Volume | volume_change, volume_ma_ratio, OBV |
-| SPY Adj Close | spy_log_return, relative_strength |
-| VIX Adj Close | vix_close, vix_log_return |
-| Date | day_of_week |
-
----
-
-## Feature Categories Summary
-
-| Category | Count | Features |
+| Feature | Values | Description |
 |---|---|---|
-| Price | 3 | log_return, return_5d, return_10d |
-| Volume | 3 | volume_change, volume_ma_ratio, obv_change |
-| Momentum | 5 | rsi_14, macd, macd_signal, macd_diff, rolling_sharpe_20 |
-| Volatility | 3 | volatility_10, atr_14, bollinger_band_width |
-| Market context | 4 | spy_log_return, vix_close, vix_log_return, relative_strength |
-| Calendar | 1 | day_of_week |
-| **Total** | **19** | |
+| `day_of_week` | 0 (Monday) – 4 (Friday) | Captures weekday seasonality effects |
 
 ---
 
-## Modeling Logic
+## Feature Count Summary
 
-Each row represents one stock on one trading day:
-
-**today's 19 features → tomorrow's return (1-day) and next week's return (5-day)**
-
-The model learns from six categories of information:
-- How the stock price moved recently (price features)
-- How actively the stock was traded (volume features)
-- Whether momentum is building or fading (momentum features)
-- How volatile the stock has been recently (volatility features)
-- What the overall market is doing (market context features)
-- What day of the week it is (calendar features)
+| Group | Count |
+|---|---:|
+| Price | 4 |
+| Volume | 3 |
+| Momentum | 5 |
+| Volatility / Risk | 8 |
+| Market context | 14 |
+| Sector | 5 |
+| Calendar | 1 |
+| **Total** | **40** |
 
 ---
 
 ## Design Decisions
 
-- **Adj Close** is used for all return calculations because it adjusts for splits and dividends
-- **Volume outliers** are clipped at 1st/99th percentile to prevent extreme values from distorting models
-- **OBV outliers** are similarly clipped
-- **Log returns** are used instead of simple returns because they are additive and more stable
-- **Two targets** allow comparison of 1-day vs 5-day prediction difficulty
-- All features are academically grounded and literature-supported
+- **Adj Close** is used for all return calculations to account for stock splits and dividends.
+- **Log returns** are used instead of simple returns: they are additive across time, more stationary, and better behaved for regression.
+- **Sector features** use leave-one-out averaging to prevent a stock from learning its own future return through the sector signal.
+- **Volume outliers** and **OBV outliers** are clipped at the 1st/99th percentile per stock to prevent extreme events from distorting models.
+- **Targets use non-overlapping forward windows**: the 5-day target at row t equals the sum of log returns from t+1 to t+5, which equals `log(price[t+5] / price[t])`. This is verified against actual prices.
+- **StandardScaler** is fitted only on the training split and applied identically to validation and test — no look-ahead bias from normalization.

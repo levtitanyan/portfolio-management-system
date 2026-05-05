@@ -1,66 +1,26 @@
 """
 Download daily historical market data from Yahoo Finance with yfinance.
 
-Downloads 30 large U.S. stocks across sectors, plus SPY (market proxy)
+Downloads 30 large U.S. stocks across sectors, plus market reference ETFs
 and VIX (volatility index). Saves one CSV per ticker in data/raw/.
 
 Run from the project root:
     python src/dataset/1_download_yahoo_data.py
 """
 
+import sys
 from pathlib import Path
 
 import pandas as pd
 import yfinance as yf
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from universes import get_all_download_tickers, get_data_dir
 
 START_DATE = "2015-01-01"
-END_DATE = "2026-04-01"  # was "2025-01-01"
-OUTPUT_DIR = Path("data/raw")
-
-TICKERS = [
-    # ── Technology ─────────────────────────────────────────────────────────────
-    "AAPL",   # Apple
-    "MSFT",   # Microsoft
-    "GOOGL",  # Alphabet (Google)
-    "NVDA",   # NVIDIA
-    "ADBE",   # Adobe
-    "CRM",    # Salesforce
-    # ── Financials ─────────────────────────────────────────────────────────────
-    "JPM",    # JPMorgan Chase
-    "GS",     # Goldman Sachs
-    "V",      # Visa
-    "BAC",    # Bank of America
-    # ── Consumer / Retail ──────────────────────────────────────────────────────
-    "WMT",    # Walmart
-    "HD",     # Home Depot
-    "MCD",    # McDonald's
-    "AMZN",   # Amazon
-    "NKE",    # Nike
-    "COST",   # Costco
-    # ── Healthcare ─────────────────────────────────────────────────────────────
-    "JNJ",    # Johnson & Johnson
-    "PFE",    # Pfizer
-    "UNH",    # UnitedHealth
-    "ABT",    # Abbott Laboratories
-    # ── Consumer Staples ───────────────────────────────────────────────────────
-    "PG",     # Procter & Gamble
-    "KO",     # Coca-Cola
-    # ── Energy ─────────────────────────────────────────────────────────────────
-    "CVX",    # Chevron
-    "XOM",    # ExxonMobil
-    # ── Industrials ────────────────────────────────────────────────────────────
-    "CAT",    # Caterpillar
-    "HON",    # Honeywell
-    "BA",     # Boeing
-    # ── Other ──────────────────────────────────────────────────────────────────
-    "IBM",    # IBM
-    "DIS",    # Disney
-    "NEE",    # NextEra Energy (Utilities)
-    # ── Market references ──────────────────────────────────────────────────────
-    "SPY",    # SPDR S&P 500 ETF
-    "^VIX",   # CBOE Volatility Index
-]
+END_DATE   = "2026-04-01"
+OUTPUT_DIR = get_data_dir() / "raw"
+TICKERS    = get_all_download_tickers()
 
 CSV_COLUMNS = ["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume"]
 

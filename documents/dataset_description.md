@@ -1,66 +1,106 @@
-# Raw Data Description
+# Dataset Description
 
+## Overview
 
+The project downloads daily OHLCV data for 30 U.S. equity stocks plus five market reference instruments. Two distinct stock universes are supported and can be selected at runtime via `run_all.py --universe <name>`.
 
-This file describes the raw data collected for the capstone project before feature engineering.
+## Stock Universes
 
+### Universe 1 — Diversified Blue-Chip (`tech30`)
 
-## Dataset Selection Rationale
+30 large-cap U.S. stocks across eight sectors:
 
-For the first version of the project, a set of **15 large, well-known U.S. stocks** was selected from major sectors, together with **SPY** and **VIX** as market context variables. These stocks were chosen because they are highly liquid, widely studied, and provide a manageable starting universe for building and testing the full pipeline.
+| Sector | Tickers |
+|---|---|
+| Technology | AAPL, MSFT, GOOGL, NVDA, ADBE, CRM, IBM |
+| Financials | JPM, GS, V, BAC |
+| Consumer | WMT, HD, MCD, AMZN, NKE, COST |
+| Healthcare | JNJ, PFE, UNH, ABT |
+| Staples | PG, KO |
+| Energy | CVX, XOM |
+| Industrials | CAT, HON, BA |
+| Communication / Utilities | DIS, NEE |
 
-The project starts with 15 stocks to keep the first modeling stage simple and interpretable. After the data pipeline, feature engineering, modeling, and backtesting process work correctly, the stock universe can be expanded, for example to the full **Dow 30** or another broader set.
+### Universe 2 — Pure Energy Sector (`energy30`)
 
-The selected features are based on both practical modeling needs and financial literature. They include stock-specific signals such as returns, volume, momentum, and volatility, as well as market-wide context through SPY and VIX. The idea is to begin with a small, defensible, and interpretable feature set, then later test whether adding more features improves results in a meaningful way.
+30 U.S. energy stocks across five sub-sectors:
 
-## Source
+| Sub-sector | Tickers |
+|---|---|
+| Integrated / Major | XOM, CVX, COP |
+| E&P large-cap | EOG, OXY, DVN, HES, APA |
+| E&P mid-cap | FANG, AR, MTDR, SM, MUR, NOG, OVV |
+| Refining | MPC, PSX, VLO, PBF |
+| Midstream / LNG | KMI, WMB, OKE, ET, EPD, TRGP, LNG |
+| Oilfield Services | SLB, HAL, RIG |
+| Power | NRG |
 
-The data was downloaded from **Yahoo Finance** using the `yfinance` Python library.
+All 30 energy stocks have uninterrupted Yahoo Finance data from 2015-01-02 onwards. Verified before selection.
 
-## Assets Collected
+## Market Reference Instruments
 
-### Stocks
-- **AAPL** — Apple
-- **MSFT** — Microsoft
-- **JPM** — JPMorgan Chase
-- **GS** — Goldman Sachs
-- **V** — Visa
-- **WMT** — Walmart
-- **HD** — Home Depot
-- **MCD** — McDonald’s
-- **JNJ** — Johnson & Johnson
-- **PG** — Procter & Gamble
-- **KO** — Coca-Cola
-- **CVX** — Chevron
-- **CAT** — Caterpillar
-- **IBM** — IBM
-- **DIS** — Disney
+Downloaded for every universe, used as market context features but not as trading targets:
 
-### Market Context
-- **SPY** — ETF proxy for the S&P 500
-- **^VIX** — CBOE Volatility Index
+| Ticker | Description |
+|---|---|
+| SPY | SPDR S&P 500 ETF — broad market proxy |
+| QQQ | Nasdaq 100 ETF — growth / tech sector proxy |
+| DIA | Dow Jones Industrial Average ETF |
+| IWM | Russell 2000 ETF — small-cap proxy |
+| ^VIX | CBOE Volatility Index — market fear gauge |
 
 ## Time Period
 
-- **Start:** 2015-01-01
-- **End:** 2025-01-01
-- **Rows per file:** 2516 trading days
+| Parameter | Value |
+|---|---|
+| Start | 2015-01-01 |
+| End | 2026-04-01 |
+| Rows per file | ~2,827 trading days |
+| Source | Yahoo Finance via `yfinance` |
 
 ## Raw Columns
 
-Each CSV file contains:
+Each downloaded CSV contains:
 
-- **Date** — trading day
-- **Open** — opening price
-- **High** — highest price of the day
-- **Low** — lowest price of the day
-- **Close** — closing price
-- **Adj Close** — adjusted closing price
-- **Volume** — number of shares traded that day
+| Column | Description |
+|---|---|
+| Date | Trading date (YYYY-MM-DD) |
+| Open | Opening price |
+| High | Intraday high |
+| Low | Intraday low |
+| Close | Closing price |
+| Adj Close | Dividend- and split-adjusted closing price |
+| Volume | Number of shares traded |
+
+`Adj Close` is used for all return and feature calculations. Raw `Close` is a fallback only when `Adj Close` is unavailable.
 
 ## Storage
 
-Each asset was saved as a separate CSV file in:
+```
+data/{universe}/
+    raw/
+        AAPL.csv
+        MSFT.csv
+        ...
+        SPY.csv  QQQ.csv  DIA.csv  IWM.csv  VIX.csv
+    processed/
+        AAPL.csv
+        ...
+    final_model_dataset.csv
+    splits/
+        train.csv
+        val.csv
+        test.csv
+```
 
-```bash
-data/raw/
+## Train / Validation / Test Split
+
+Splits are chronological and strictly non-overlapping:
+
+| Split | Date range | Approximate years |
+|---|---|---|
+| Train | 2015-01-02 → 2021-12-31 | 7 years |
+| Validation | 2022-01-01 → 2023-12-31 | 2 years |
+| Test | 2024-01-01 → 2026-02-17 | ~2 years |
+
+The scaler (`StandardScaler`) is fitted on the training split only and applied identically to validation and test — no look-ahead bias.

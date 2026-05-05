@@ -4,6 +4,8 @@ Gather model output artifacts into performance report tables.
 Reads:
     outputs/**/metrics_1d.json
     outputs/**/metrics_5d.json
+    outputs/**/metrics_10d.json
+    outputs/**/metrics_30d.json
     outputs/**/per_ticker_1d.csv
     outputs/**/per_ticker_5d.csv
 
@@ -11,6 +13,8 @@ Writes:
     outputs/reports/performance_report.md
     outputs/reports/model_performance_1d.csv
     outputs/reports/model_performance_5d.csv
+    outputs/reports/model_performance_10d.csv
+    outputs/reports/model_performance_30d.csv
     outputs/reports/stock_model_performance_1d.csv
     outputs/reports/stock_model_performance_5d.csv
 
@@ -22,19 +26,25 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from universes import get_outputs_dir
 
-BASE_DIR = Path(__file__).resolve().parents[2]
-OUTPUTS_DIR = BASE_DIR / "outputs"
-REPORT_DIR = OUTPUTS_DIR / "reports"
+BASE_DIR    = Path(__file__).resolve().parents[2]
+OUTPUTS_DIR = get_outputs_dir()
+REPORT_DIR  = OUTPUTS_DIR / "reports"
+MD_DIR      = REPORT_DIR / "md"
 
 HORIZONS = {
     "1d": "1 Day",
     "5d": "5 Day",
+    "10d": "10 Day",
+    "30d": "30 Day",
 }
 
 SPLITS = ("train", "validation", "test")
@@ -46,6 +56,8 @@ BACKTEST_METRICS = (
     "sharpe_ratio",
     "max_drawdown",
     "n_trading_days",
+    "n_periods",
+    "holding_days",
 )
 
 MODEL_CSV_COLUMNS = [
@@ -67,16 +79,22 @@ MODEL_CSV_COLUMNS = [
     "long_only_sharpe_ratio",
     "long_only_max_drawdown",
     "long_only_n_trading_days",
+    "long_only_n_periods",
+    "long_only_holding_days",
     "long_short_final_value",
     "long_short_total_return",
     "long_short_sharpe_ratio",
     "long_short_max_drawdown",
     "long_short_n_trading_days",
+    "long_short_n_periods",
+    "long_short_holding_days",
     "buy_and_hold_benchmark_final_value",
     "buy_and_hold_benchmark_total_return",
     "buy_and_hold_benchmark_sharpe_ratio",
     "buy_and_hold_benchmark_max_drawdown",
     "buy_and_hold_benchmark_n_trading_days",
+    "buy_and_hold_benchmark_n_periods",
+    "buy_and_hold_benchmark_holding_days",
     "backtest_error",
 ]
 
@@ -241,12 +259,20 @@ def order_columns(df: pd.DataFrame, preferred_columns: list[str]) -> pd.DataFram
 
 
 def sort_model_table(df: pd.DataFrame) -> pd.DataFrame:
-    """Sort aggregate rows by test RMSE, then model name."""
+    """Sort by long-only return descending, then RMSE ascending as tiebreak."""
     if df.empty:
         return df
 
-    sort_columns = [column for column in ("test_rmse", "test_mae", "model") if column in df.columns]
-    return df.sort_values(sort_columns, na_position="last").reset_index(drop=True)
+    if "long_only_total_return" in df.columns:
+        df = df.copy()
+        df["_ret"] = pd.to_numeric(df["long_only_total_return"], errors="coerce")
+        df["_rmse"] = pd.to_numeric(df.get("test_rmse", 0), errors="coerce")
+        df = df.sort_values(["_ret", "_rmse"], ascending=[False, True], na_position="last")
+        df = df.drop(columns=["_ret", "_rmse"])
+    else:
+        sort_columns = [c for c in ("test_rmse", "test_mae", "model") if c in df.columns]
+        df = df.sort_values(sort_columns, na_position="last")
+    return df.reset_index(drop=True)
 
 
 def sort_stock_table(df: pd.DataFrame) -> pd.DataFrame:
@@ -259,7 +285,7 @@ def sort_stock_table(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def write_csv_tables(model_df: pd.DataFrame, stock_df: pd.DataFrame) -> list[Path]:
-    """Write separate aggregate and stock-model CSV tables for each horizon."""
+    """Write aggregate and per-ticker CSV tables for each horizon."""
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
 
@@ -373,9 +399,9 @@ def report_lines(model_df: pd.DataFrame, stock_df: pd.DataFrame, csv_paths: list
 
 
 def write_markdown_report(model_df: pd.DataFrame, stock_df: pd.DataFrame, csv_paths: list[Path]) -> Path:
-    """Write the human-readable Markdown report."""
-    REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    report_path = REPORT_DIR / "performance_report.md"
+    """Write the human-readable Markdown performance report."""
+    MD_DIR.mkdir(parents=True, exist_ok=True)
+    report_path = MD_DIR / "performance_report.md"
     report_path.write_text("\n".join(report_lines(model_df, stock_df, csv_paths)), encoding="utf-8")
     return report_path
 

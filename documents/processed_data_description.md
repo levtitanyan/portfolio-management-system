@@ -1,154 +1,156 @@
 # Processed Data Description
 
-This file describes the processed dataset created after feature engineering for the stock return prediction and portfolio management capstone project.
-
 ## Purpose
 
-The processed dataset is the modeling-ready version of the raw stock data. It combines:
+The processed dataset is the modeling-ready output of the feature engineering pipeline. It combines per-stock technical indicators, multi-ETF market context, sector context, risk features, and forward-return targets into a single panel dataset where each row represents one stock on one trading day.
 
-- stock-level features
-- market context from **SPY**
-- volatility context from **VIX**
-- the prediction target for the next trading day
+**Row meaning:** today's 40 features → forward return at 1 / 5 / 10 / 30 trading days.
 
-The goal is to use **today's information** to predict **tomorrow's stock return**.
+---
 
-## Output Files
+## Why the Dataset Starts Later Than Raw Data
 
-After running the feature engineering pipeline, the project creates:
+Some features require a historical lookback window, so the first valid row for each stock is offset from the raw start date:
 
-- **Per-stock processed files** in `data/processed/`
-- **One combined modeling dataset** in `data/final_model_dataset.csv`
+| Feature | Lookback needed |
+|---|---|
+| `log_return` | 1 day |
+| `rsi_14` | 14 days |
+| `macd` | 26-day EMA warmup |
+| `beta_60`, `idiosyncratic_vol_20` | 60 days |
+| `rolling_sharpe_20`, `volatility_20` | 20 days |
+| `volatility_30`, `return_30d` | 30 days |
 
-Each row in the processed dataset represents:
+Additionally, the last 30 rows per stock are dropped because the 30-day forward target requires 30 future days. In practice the combined dataset runs from approximately 2015-04 to 2025-11 after NaN removal.
 
-**today's stock and market features -> tomorrow's stock return**
+---
 
-## Why the Processed Dataset Starts Later Than the Raw Data
+## Reference Columns
 
-The processed dataset does not start on the very first raw date because some features need historical lookback windows.
+| Column | Description |
+|---|---|
+| `Date` | Trading date (YYYY-MM-DD) |
+| `ticker` | Stock symbol (e.g. `AAPL`) |
+| `adj_close` | Dividend- and split-adjusted closing price |
+| `volume` | Number of shares traded |
 
-- `log_return` needs the previous day
-- `rsi_14` needs recent price history
-- `macd`, `macd_signal`, and `macd_diff` need moving averages
-- `volatility_10` needs 10 days of returns
-- `target_next_day_return` uses a shift of `-1`, so the last row is dropped
+---
 
-Because of this, early rows and the final row are removed after feature creation.
+## Feature Columns (40)
 
-## Processed Columns
+### Price (4)
 
-### Date
+| Column | Formula |
+|---|---|
+| `log_return` | `ln(adj_close_t / adj_close_{t-1})` |
+| `return_5d` | `sum(log_return, last 5 days)` |
+| `return_10d` | `sum(log_return, last 10 days)` |
+| `return_30d` | `sum(log_return, last 30 days)` |
 
-- **What it is:** the trading date for the row
-- **How it is created:** taken from the original stock CSV and matched with SPY and VIX by date
-- **Why it is useful:** it keeps all stock and market features aligned in time
+### Volume (3)
 
-### ticker
+| Column | Formula |
+|---|---|
+| `volume_change` | `(volume_t / volume_{t-1}) - 1`, clipped [1%, 99%] |
+| `volume_ma_ratio` | `volume_t / mean(volume, 20 days)` |
+| `obv_change` | Daily pct change in On-Balance Volume, clipped [1%, 99%] |
 
-- **What it is:** the stock symbol, such as `AAPL` or `MSFT`
-- **How it is created:** taken from the stock file name during the per-stock processing loop
-- **Why it is useful:** it identifies which stock each row belongs to and allows all stocks to be combined into one dataset
+### Momentum (5)
 
-### adj_close
+| Column | Formula |
+|---|---|
+| `rsi_14` | 14-day RSI |
+| `macd` | `EMA(adj_close, 12) - EMA(adj_close, 26)` |
+| `macd_signal` | `EMA(macd, 9)` |
+| `macd_diff` | `macd - macd_signal` |
+| `rolling_sharpe_20` | `mean(log_return, 20) / std(log_return, 20)` |
 
-- **What it is:** the adjusted closing price of the stock
-- **How it is created:** taken from the raw `Adj Close` column
-- **Why it is useful:** adjusted close accounts for stock splits and dividends, so it is better than raw close for return calculations
+### Volatility and Risk (8)
 
-### volume
+| Column | Formula |
+|---|---|
+| `volatility_10` | `std(log_return, 10 days)` |
+| `volatility_20` | `std(log_return, 20 days)` |
+| `volatility_30` | `std(log_return, 30 days)` |
+| `atr_14` | 14-day Average True Range |
+| `bollinger_band_width` | `(upper_band - lower_band) / middle_band` (20-day Bollinger) |
+| `beta_60` | `cov(log_return, spy_log_return, 60) / var(spy_log_return, 60)` |
+| `idiosyncratic_vol_20` | `std(log_return - beta_60 × spy_log_return, 20 days)` |
+| `volatility_regime_20` | `volatility_20 / mean(volatility_20, 60 days)` |
 
-- **What it is:** the number of shares traded that day
-- **How it is created:** taken from the raw `Volume` column
-- **Why it is useful:** trading activity can provide information about liquidity, attention, and unusual market behavior
+### Market Context (14)
 
-### log_return
+| Column | Source |
+|---|---|
+| `spy_log_return` | SPY daily log return |
+| `spy_return_5d` | SPY 5-day cumulative log return |
+| `spy_return_10d` | SPY 10-day cumulative log return |
+| `spy_return_30d` | SPY 30-day cumulative log return |
+| `spy_volatility_20` | SPY 20-day realized volatility |
+| `qqq_log_return` | QQQ daily log return |
+| `qqq_return_5d` | QQQ 5-day cumulative log return |
+| `dia_log_return` | DIA daily log return |
+| `dia_return_5d` | DIA 5-day cumulative log return |
+| `iwm_log_return` | IWM daily log return |
+| `iwm_return_5d` | IWM 5-day cumulative log return |
+| `vix_close` | VIX daily closing level |
+| `vix_log_return` | VIX daily log return |
+| `relative_strength` | `log_return - spy_log_return` |
 
-- **What it is:** the stock's daily log return
-- **How it is created:** `ln(adj_close_t / adj_close_t-1)`
-- **Why it is useful:** this is the main daily price movement feature and is often easier to model than raw prices
+### Sector (5)
 
-### volume_change
+Computed as leave-one-out equal-weighted average of all other stocks in the same sector. This prevents a stock from leaking its own future return into the sector signal.
 
-- **What it is:** the day-to-day percentage change in trading volume
-- **How it is created:** `(volume_t / volume_t-1) - 1`
-- **Why it is useful:** it shows whether trading activity increased or decreased compared with the previous day
+| Column | Description |
+|---|---|
+| `sector_log_return` | Average daily log return across sector peers |
+| `sector_return_5d` | Average 5-day cumulative return across peers |
+| `sector_return_10d` | Average 10-day cumulative return across peers |
+| `sector_return_30d` | Average 30-day cumulative return across peers |
+| `sector_relative_strength` | `log_return - sector_log_return` |
 
-### rsi_14
+### Calendar (1)
 
-- **What it is:** the 14-day Relative Strength Index
-- **How it is created:** calculated from recent gains and losses over a 14-day window
-- **Why it is useful:** it is a momentum indicator that may help detect overbought or oversold conditions
+| Column | Values | Description |
+|---|---|---|
+| `day_of_week` | 0–4 | 0 = Monday, 4 = Friday — weekday seasonality |
 
-### macd
+---
 
-- **What it is:** the Moving Average Convergence Divergence value
-- **How it is created:** `EMA(12) - EMA(26)`
-- **Why it is useful:** it measures trend and momentum by comparing short-term and long-term moving averages
+## Target Columns (4)
 
-### macd_signal
+| Column | Formula | Horizon |
+|---|---|---|
+| `target_next_day_return` | `log_return.shift(-1)` | 1 day |
+| `target_5d_return` | `log_return.rolling(5).sum().shift(-5)` | 5 days |
+| `target_10d_return` | `log_return.rolling(10).sum().shift(-10)` | 10 days |
+| `target_30d_return` | `log_return.rolling(30).sum().shift(-30)` | 30 days |
 
-- **What it is:** the MACD signal line
-- **How it is created:** 9-day EMA of `macd`
-- **Why it is useful:** it smooths MACD and helps identify momentum shifts
+All targets are log returns. During model evaluation they are converted to simple returns via `expm1()` for portfolio simulation.
 
-### macd_diff
+---
 
-- **What it is:** the gap between MACD and its signal line
-- **How it is created:** `macd - macd_signal`
-- **Why it is useful:** it highlights the strength and direction of momentum changes
+## Dataset Dimensions
 
-### volatility_10
+After NaN removal (lookback warmup + forward target rows dropped):
 
-- **What it is:** the rolling 10-day standard deviation of stock log returns
-- **How it is created:** standard deviation of the last 10 values of `log_return`
-- **Why it is useful:** it measures recent instability or risk in the stock's price movement
+| Universe | Rows | Stocks | Features | Targets |
+|---|---:|---:|---:|---:|
+| tech30 | ~80,670 | 30 | 40 | 4 |
+| energy30 | ~80,670 | 30 | 40 | 4 |
 
-### spy_log_return
+---
 
-- **What it is:** the daily log return of SPY
-- **How it is created:** `ln(SPY_t / SPY_t-1)`
-- **Why it is useful:** SPY is used as a proxy for the overall U.S. stock market, so this feature gives market-wide context
+## File Locations
 
-### vix_close
-
-- **What it is:** the VIX level on that trading day
-- **How it is created:** taken from the VIX closing series
-- **Why it is useful:** VIX is the market fear and volatility index, so it helps capture broader market stress
-
-### vix_log_return
-
-- **What it is:** the daily log return of VIX
-- **How it is created:** `ln(VIX_t / VIX_t-1)`
-- **Why it is useful:** it shows whether market fear or expected volatility is rising or falling
-
-### target_next_day_return
-
-- **What it is:** the stock's log return for the next trading day
-- **How it is created:** created by shifting `log_return` by `-1`
-- **Why it is useful:** this is the target variable the model tries to predict
-
-## Why These Features Were Chosen
-
-The processed dataset includes a small and interpretable set of features that capture:
-
-- **price movement** through `log_return`
-- **trading activity** through `volume` and `volume_change`
-- **momentum and trend** through `rsi_14`, `macd`, `macd_signal`, and `macd_diff`
-- **recent risk** through `volatility_10`
-- **overall market direction** through `spy_log_return`
-- **market fear / uncertainty** through `vix_close` and `vix_log_return`
-
-This gives the model both **stock-specific information** and **market-wide context**.
-
-## How the Model Uses the Processed Dataset
-
-- **X (inputs):** all feature columns except the target
-- **y (target):** `target_next_day_return`
-- **Row meaning:** today's information is used to predict tomorrow's stock return
-
-This structure makes the dataset suitable for:
-
-- train / validation / test splits
-- baseline regression models
-- sequence models such as LSTM after sequence preparation
+```
+data/{universe}/
+    final_model_dataset.csv    — combined panel (all stocks, all dates)
+    processed/
+        AAPL.csv               — per-stock processed file (tech30 example)
+        ...
+    splits/
+        train.csv              — 2015 → 2021
+        val.csv                — 2022 → 2023
+        test.csv               — 2024 → 2026
+```

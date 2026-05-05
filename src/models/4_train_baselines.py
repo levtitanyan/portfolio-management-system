@@ -21,14 +21,18 @@ Output structure per model:
         predictions_1d_test.csv, predictions_1d_val.csv
         predictions_5d_test.csv, predictions_5d_val.csv
 
-Install:  pip install pmdarima scikit-learn
+Install:  pip install scikit-learn scipy
 Run:      python src/models/4_train_baselines.py
 """
 
+import sys
 from pathlib import Path
 import json
 import warnings
 import time
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from universes import get_data_dir, get_outputs_dir
 
 import numpy as np
 import pandas as pd
@@ -38,31 +42,47 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.preprocessing import StandardScaler
 
-try:
-    from pmdarima import auto_arima
-    from pmdarima.arima import ARIMA as PmdARIMA
-except ImportError as e:
-    raise SystemExit("Missing dependency: pip install pmdarima") from e
+from backtest_utils import run_model_backtest
 
 
 BASE_DIR    = Path(__file__).resolve().parents[2]
-TRAIN_PATH  = BASE_DIR / "data" / "splits" / "train.csv"
-VAL_PATH    = BASE_DIR / "data" / "splits" / "val.csv"
-TEST_PATH   = BASE_DIR / "data" / "splits" / "test.csv"
-OUTPUT_BASE = BASE_DIR / "outputs" / "baselines"
+_DATA       = get_data_dir()
+_OUTPUTS    = get_outputs_dir()
+TRAIN_PATH  = _DATA    / "splits" / "train.csv"
+VAL_PATH    = _DATA    / "splits" / "val.csv"
+TEST_PATH   = _DATA    / "splits" / "test.csv"
+OUTPUT_BASE = _OUTPUTS / "baselines"
 
 INITIAL_CAPITAL       = 10_000.0
 TOP_K_LONGS           = 5
 BOTTOM_K_SHORTS       = 5
 TRADING_DAYS_PER_YEAR = 252
 
-TARGET_COLUMNS = ["target_next_day_return", "target_5d_return"]
+TARGET_COLUMNS = [
+    "target_next_day_return",
+    "target_5d_return",
+    "target_10d_return",
+    "target_30d_return",
+]
+TARGET_META = {
+    "target_next_day_return": ("1d", "1-DAY TARGET", 1),
+    "target_5d_return": ("5d", "5-DAY TARGET", 5),
+    "target_10d_return": ("10d", "10-DAY TARGET", 10),
+    "target_30d_return": ("30d", "30-DAY TARGET", 30),
+}
 FEATURE_COLUMNS = [
-    "log_return", "return_5d", "return_10d",
+    "log_return", "return_5d", "return_10d", "return_30d",
     "volume_change", "volume_ma_ratio", "obv_change",
     "rsi_14", "macd", "macd_signal", "macd_diff", "rolling_sharpe_20",
-    "volatility_10", "atr_14", "bollinger_band_width",
-    "spy_log_return", "vix_close", "vix_log_return", "relative_strength",
+    "volatility_10", "volatility_20", "volatility_30",
+    "atr_14", "bollinger_band_width", "beta_60", "idiosyncratic_vol_20",
+    "volatility_regime_20",
+    "spy_log_return", "spy_return_5d", "spy_return_10d", "spy_return_30d",
+    "spy_volatility_20", "qqq_log_return", "qqq_return_5d",
+    "dia_log_return", "dia_return_5d", "iwm_log_return", "iwm_return_5d",
+    "vix_close", "vix_log_return", "relative_strength",
+    "sector_log_return", "sector_return_5d", "sector_return_10d",
+    "sector_return_30d", "sector_relative_strength",
     "day_of_week",
 ]
 
@@ -142,45 +162,19 @@ def per_ticker_metrics(df, preds, target):
 
 # ── Backtest ───────────────────────────────────────────────────────────────────
 
-def sharpe(r):
-    return float(r.mean() / r.std() * np.sqrt(TRADING_DAYS_PER_YEAR)) if len(r) > 0 and r.std() > 0 else 0.0
-
-def max_dd(eq):
-    pk = np.maximum.accumulate(eq)
-    return float(((eq - pk) / pk).min()) if len(eq) > 0 else 0.0
-
-def run_backtest(df, preds, target):
-    """Run long-only, long-short, and buy-and-hold backtests."""
-    df = df.copy()
-    df["y_pred"] = preds
-    df["y_true"] = df[target]
-    lo, ls, bh = [], [], []
-
-    for _, g in df.groupby("Date"):
-        if len(g) < TOP_K_LONGS + BOTTOM_K_SHORTS:
-            continue
-        s = g.sort_values("y_pred", ascending=False)
-        t = s.head(TOP_K_LONGS)["y_true"].mean()
-        b = s.tail(BOTTOM_K_SHORTS)["y_true"].mean()
-        lo.append(t)
-        ls.append((t - b) / 2.0)
-        bh.append(g["y_true"].mean())
-
-    if not lo:
-        return {"error": "Not enough data"}
-
-    def _b(r):
-        si = np.exp(np.array(r)) - 1
-        eq = INITIAL_CAPITAL * np.cumprod(1 + si)
-        return {
-            "final_value":    float(eq[-1]),
-            "total_return":   float(eq[-1] / INITIAL_CAPITAL - 1),
-            "sharpe_ratio":   sharpe(si),
-            "max_drawdown":   max_dd(eq),
-            "n_trading_days": len(si),
-        }
-
-    return {"long_only": _b(lo), "long_short": _b(ls), "buy_and_hold_benchmark": _b(bh)}
+def run_backtest(df, preds, target, holding_days=None, benchmark_df=None):
+    """Run long-only, long-short, and horizon-independent buy-and-hold backtests."""
+    return run_model_backtest(
+        df,
+        preds,
+        target,
+        holding_days=holding_days,
+        benchmark_df=benchmark_df,
+        initial_capital=INITIAL_CAPITAL,
+        top_k_longs=TOP_K_LONGS,
+        bottom_k_shorts=BOTTOM_K_SHORTS,
+        trading_days_per_year=TRADING_DAYS_PER_YEAR,
+    )
 
 
 # ── Save helpers ───────────────────────────────────────────────────────────────
@@ -503,8 +497,7 @@ def main():
     print(f"  Tickers: {train_df['ticker'].nunique()}  Features: {len(FEATURE_COLUMNS)}")
 
     for target in TARGET_COLUMNS:
-        sfx = "1d" if "next_day" in target else "5d"
-        lbl = "1-DAY TARGET" if sfx == "1d" else "5-DAY TARGET"
+        sfx, lbl, _ = TARGET_META[target]
 
         print(f"\n{'='*60}")
         print(f"  Training baselines for {lbl}")
@@ -602,7 +595,7 @@ def main():
         # res.append(evaluate_and_save("sarimax", target, sfx, d,
         #     train_df, tr_p, val_df, va_p, test_df, te_p))
 
-        # print_summary(res, lbl)
+        print_summary(res, lbl)
 
     total_time = time.time() - total_start
     print(f"\n  Total time: {total_time/60:.1f} minutes")

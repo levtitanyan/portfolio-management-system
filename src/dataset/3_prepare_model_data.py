@@ -10,16 +10,20 @@ Run from the project root:
     python src/dataset/3_prepare_model_data.py
 """
 
+import sys
 from pathlib import Path
 
 import pandas as pd
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from universes import get_data_dir
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 
 BASE_DIR           = Path(__file__).resolve().parents[2]
-INPUT_DATASET_PATH = BASE_DIR / "data" / "final_model_dataset.csv"
-SPLITS_DIR         = BASE_DIR / "data" / "splits"
+_DATA              = get_data_dir()
+INPUT_DATASET_PATH = _DATA / "final_model_dataset.csv"
+SPLITS_DIR         = _DATA / "splits"
 
 TRAIN_PATH = SPLITS_DIR / "train.csv"
 VAL_PATH   = SPLITS_DIR / "val.csv"
@@ -27,19 +31,16 @@ TEST_PATH  = SPLITS_DIR / "test.csv"
 
 # ── Split boundaries ───────────────────────────────────────────────────────────
 
-# old params
-TRAIN_END_DATE = "2021-12-31"
-VAL_END_DATE   = "2023-12-31"
-
-# new params
-# TRAIN_END_DATE = "2021-12-31"
-# VAL_END_DATE   = "2025-12-31"
+TRAIN_END_DATE = "2021-12-31"   # Train: 2015–2021 (7 years)
+VAL_END_DATE   = "2023-12-31"   # Val:   2022–2023 (2 years), Test: 2024+ (~2 years)
 
 # ── Column definitions ─────────────────────────────────────────────────────────
 
 TARGET_COLUMNS = [
     "target_next_day_return",
     "target_5d_return",
+    "target_10d_return",
+    "target_30d_return",
 ]
 
 FEATURE_COLUMNS = [
@@ -47,6 +48,7 @@ FEATURE_COLUMNS = [
     "log_return",
     "return_5d",
     "return_10d",
+    "return_30d",
     # Volume
     "volume_change",
     "volume_ma_ratio",
@@ -59,13 +61,34 @@ FEATURE_COLUMNS = [
     "rolling_sharpe_20",
     # Volatility
     "volatility_10",
+    "volatility_20",
+    "volatility_30",
     "atr_14",
     "bollinger_band_width",
+    "beta_60",
+    "idiosyncratic_vol_20",
+    "volatility_regime_20",
     # Market context
     "spy_log_return",
+    "spy_return_5d",
+    "spy_return_10d",
+    "spy_return_30d",
+    "spy_volatility_20",
+    "qqq_log_return",
+    "qqq_return_5d",
+    "dia_log_return",
+    "dia_return_5d",
+    "iwm_log_return",
+    "iwm_return_5d",
     "vix_close",
     "vix_log_return",
     "relative_strength",
+    # Sector
+    "sector_log_return",
+    "sector_return_5d",
+    "sector_return_10d",
+    "sector_return_30d",
+    "sector_relative_strength",
     # Calendar
     "day_of_week",
 ]
