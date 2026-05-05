@@ -240,13 +240,27 @@ def train_ridge(X, y):
     m.fit(X, y)
     return m
 
-def train_rf(X, y, n):
-    """Random Forest with time-weighted samples — recent data weighted higher."""
+def make_date_weights(dates: pd.Series) -> np.ndarray:
+    """
+    Assign sample weights by date rank so that all stocks on the same date
+    get the same weight and newer dates get linearly higher weight.
+    Weights range from 0.5 (oldest date) to 1.0 (newest date).
+    """
+    unique_dates = dates.sort_values().unique()
+    date_to_weight = {d: w for d, w in zip(
+        unique_dates,
+        np.linspace(0.5, 1.0, len(unique_dates)),
+    )}
+    return dates.map(date_to_weight).to_numpy(dtype=float)
+
+
+def train_rf(X, y, sample_weight: np.ndarray):
+    """Random Forest with date-based time weighting — newer dates weighted higher."""
     m = RandomForestRegressor(
         n_estimators=200, max_depth=8, min_samples_leaf=5,
         random_state=42, n_jobs=-1,
     )
-    m.fit(X, y, sample_weight=np.linspace(0.5, 1.0, n))
+    m.fit(X, y, sample_weight=sample_weight)
     return m
 
 
@@ -552,7 +566,7 @@ def main():
         # ── 5. Random Forest ─────────────────────────────────────────────────
         print("  Training: Random Forest")
         d = OUTPUT_BASE / "random_forest"; d.mkdir(parents=True, exist_ok=True)
-        rf = train_rf(Xts, y_tr, len(Xts))
+        rf = train_rf(Xts, y_tr, make_date_weights(train_df["Date"]))
         res.append(evaluate_and_save("random_forest", target, sfx, d,
             train_df, rf.predict(Xts),
             val_df,   rf.predict(Xvs),

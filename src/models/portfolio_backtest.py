@@ -52,7 +52,7 @@ import numpy as np
 import pandas as pd
 from scipy.stats import ttest_1samp
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from universes import get_data_dir, get_outputs_dir
 
 warnings.filterwarnings("ignore")

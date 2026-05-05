@@ -15,7 +15,7 @@ import pandas as pd
 import yfinance as yf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from universes import get_all_download_tickers, get_data_dir
+from universes import get_all_download_tickers, get_data_dir, get_tickers
 
 START_DATE = "2015-01-01"
 END_DATE   = "2026-04-01"
@@ -138,6 +138,12 @@ def main() -> None:
             print(f"  {ticker:<6} {error_message}")
 
     print(f"\nFiles saved to: {OUTPUT_DIR.resolve()}")
+
+    stock_tickers = set(get_tickers())
+    stock_failures = [t for t, _ in failed if t in stock_tickers]
+    if stock_failures:
+        print(f"\n[ERROR] {len(stock_failures)} stock ticker(s) failed to download: {stock_failures}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

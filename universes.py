@@ -36,7 +36,7 @@ TECH30 = [
 
 ENERGY30 = [
     "XOM",  "CVX",  "COP",                              # Integrated / Major
-    "EOG",  "OXY",  "DVN",  "HES",  "APA",             # E&P large-cap
+    "EOG",  "OXY",  "DVN",  "SU",   "APA",             # E&P large-cap
     "FANG", "AR",   "MTDR", "SM",   "MUR",  "NOG",     # E&P mid-cap
     "OVV",                                              # E&P (Ovintiv)
     "MPC",  "PSX",  "VLO",  "PBF",                     # Refining
@@ -66,7 +66,7 @@ SECTOR_MAP: dict[str, str] = {
     "NEE":  "utilities",
     # energy30
     "COP":  "energy", "EOG":  "energy", "OXY":  "energy", "DVN":  "energy",
-    "HES":  "energy", "APA":  "energy", "FANG": "energy", "AR":   "energy",
+    "SU":   "energy", "APA":  "energy", "FANG": "energy", "AR":   "energy",
     "MTDR": "energy", "SM":   "energy", "MUR":  "energy", "NOG":  "energy",
     "OVV":  "energy", "MPC":  "energy", "PSX":  "energy", "VLO":  "energy",
     "PBF":  "energy", "KMI":  "energy", "WMB":  "energy", "OKE":  "energy",

@@ -221,7 +221,13 @@ def run_model_backtest(
     if not long_only_returns:
         return {"error": "Not enough data"}
 
+    # Align benchmark to the strategy's actual trading window so returns are
+    # comparable. Without this, the benchmark starts at the first test date
+    # while the strategy starts at its first rebalancing date (which may be
+    # the same day but the strategy's last period can extend further).
     benchmark_source = benchmark_df.copy() if benchmark_df is not None else work
+    benchmark_source["Date"] = pd.to_datetime(benchmark_source["Date"])
+    benchmark_source = benchmark_source[benchmark_source["Date"] >= rebal_dates[0]]
     buy_hold = static_buy_and_hold_benchmark(
         benchmark_source,
         initial_capital=initial_capital,

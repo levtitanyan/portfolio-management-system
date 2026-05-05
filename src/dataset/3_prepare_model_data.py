@@ -126,6 +126,8 @@ def load_dataset(csv_path: Path) -> pd.DataFrame:
     return df
 
 
+MAX_HORIZON = 30  # trading days — longest forward target window
+
 def split_dataset(
     df: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -142,6 +144,24 @@ def split_dataset(
             raise ValueError(f"{name} split is empty. Check date boundaries.")
 
     return train_df, val_df, test_df
+
+
+def trim_horizon_leakage(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Drop the last MAX_HORIZON rows per ticker from each split.
+
+    The 30-day target for a row at date T uses returns from T+1 to T+30.
+    Without trimming, rows near a split boundary have targets that include
+    returns from the NEXT split (e.g., late-train rows include validation
+    returns). Trimming 30 rows per ticker eliminates all cross-boundary
+    target contamination for every horizon (1d, 5d, 10d, 30d).
+
+    This also ensures the final portfolio backtest benchmark covers the
+    same calendar window as the strategy's last rebalancing period.
+    """
+    df = df.sort_values(["ticker", "Date"]).reset_index(drop=True)
+    keep = df.groupby("ticker").cumcount(ascending=False) >= MAX_HORIZON
+    return df[keep].reset_index(drop=True)
 
 
 def validate_split_order(
@@ -186,11 +206,19 @@ def summarize_splits(
 
 
 def main() -> None:
-    """Load, split, validate, save, and summarize."""
+    """Load, split, trim boundary leakage, validate, save, and summarize."""
     SPLITS_DIR.mkdir(parents=True, exist_ok=True)
 
     df = load_dataset(INPUT_DATASET_PATH)
     train_df, val_df, test_df = split_dataset(df)
+
+    # Trim last 30 rows per ticker from every split so no target crosses
+    # into the next split (eliminates train→val and val→test leakage, and
+    # aligns the test benchmark window with the strategy's last trade).
+    train_df = trim_horizon_leakage(train_df)
+    val_df   = trim_horizon_leakage(val_df)
+    test_df  = trim_horizon_leakage(test_df)
+
     validate_split_order(train_df, val_df, test_df)
 
     save_split(train_df, TRAIN_PATH)

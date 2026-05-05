@@ -50,7 +50,8 @@ STEPS = [
     ("tcn",       "src/models/7_train_tcn.py"),
     ("refresh",   "src/models/98_refresh_backtests.py"),
     ("report",    "src/models/99_gather_report.py"),
-    ("backtest",  "portfolio_backtest.py"),
+    ("backtest",  "src/models/portfolio_backtest.py"),
+    ("figures",   "src/models/generate_figures.py"),
 ]
 
 DL_STEPS = {"lstm", "gru", "tcn"}
@@ -187,9 +188,8 @@ def main() -> None:
         print("  PIPELINE FAILED — see error above")
     else:
         print("  PIPELINE COMPLETE")
-        print(f"\n  Reports:")
-        print(f"    outputs/{args.universe}/reports/md/performance_report.md")
-        print(f"    outputs/{args.universe}/reports/md/backtest_report.md")
+        print(f"\n  All figures + reports → outputs/figures/")
+        print(f"  Per-universe CSVs    → outputs/{args.universe}/reports/")
     print(f"\n  Total time: {total / 60:.1f} minutes")
     print("=" * 60)
 
